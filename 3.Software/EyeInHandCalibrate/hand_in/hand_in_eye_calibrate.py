@@ -8,6 +8,14 @@ import os
 import cv2
 import numpy as np
 
+from calibration_settings import (
+    CALIBRATION_DATA_DIR,
+    CALIBRATION_OUTPUT_DIR,
+    CHESSBOARD_COLS,
+    CHESSBOARD_ROWS,
+    CHECKER_SQUARE_SIZE_M,
+)
+
 np.set_printoptions(precision=8, suppress=True)
 
 def euler_angles_to_rotation_matrix(rx, ry, rz):
@@ -33,7 +41,11 @@ def pose_to_homogeneous_matrix(pose):
     t = np.array([x, y, z]).reshape(3, 1)
     return R, t
 
-def init_calibration_params(pattern_cols=11, pattern_rows=8, square_size=0.035):
+def init_calibration_params(
+    pattern_cols=CHESSBOARD_COLS,
+    pattern_rows=CHESSBOARD_ROWS,
+    square_size=CHECKER_SQUARE_SIZE_M,
+):
     """
     初始化标定参数
     
@@ -47,7 +59,7 @@ def init_calibration_params(pattern_cols=11, pattern_rows=8, square_size=0.035):
     """
     return pattern_cols, pattern_rows, square_size
 
-def save_matrices_to_txt(matrices_dict, filename="all"):
+def save_matrices_to_txt(matrices_dict, filename="all", output_dir=CALIBRATION_OUTPUT_DIR):
     """
     保存多个矩阵到同一个txt文件
     matrices_dict: 字典，键为矩阵名称，值为矩阵数据
@@ -57,7 +69,7 @@ def save_matrices_to_txt(matrices_dict, filename="all"):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 创建输出目录的完整路径
-    save_dir = os.path.join(current_dir, "measured_data_in")
+    save_dir = os.path.join(current_dir, output_dir)
     
     # 确保目录存在
     os.makedirs(save_dir, exist_ok=True)
@@ -126,8 +138,12 @@ def camera_calibrate(images_path, pattern_params):
     img_points = []  # 图像坐标系中的2D点
 
     # 遍历文件夹内所有图片并按数字顺序排序
-    image_files = [f for f in os.listdir(images_path) if f.endswith('.jpg')]
-    image_files.sort(key=lambda x: int(x.replace('images', '').replace('.jpg', '')))
+    image_files = [f for f in os.listdir(images_path) if f.lower().endswith('.jpg')]
+    image_files.sort(
+        key=lambda name: int(
+            os.path.splitext(name[len("images"):] if name.startswith("images") else name)[0]
+        )
+    )
     image_files = [os.path.join(images_path, f) for f in image_files]
 
     if not image_files:
@@ -163,13 +179,17 @@ def camera_calibrate(images_path, pattern_params):
 
     cv2.destroyAllWindows()
 
-    if not obj_points:
-        print("错误: 没有找到任何有效的标定点。")
+    if len(obj_points) < 10:
+        print(
+            f"错误: 只有 {len(obj_points)} 张图片识别到完整角点。"
+            "请重新采集至少 10 组有效样本，建议 20-30 组。"
+        )
         return None, None, None, None
 
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(obj_points, img_points, size, None, None)
 
     if ret:
+        print(f"相机标定重投影 RMS 误差: {ret:.4f} 像素")
         print("内参矩阵:\n", mtx)
         print("畸变系数:\n", dist)
         print("++++++++++ 相机标定完成 ++++++++++++++")
@@ -243,16 +263,12 @@ def hand_eye_calibrate(images_path, arm_pose_file, pattern_params):
 
 if __name__ == "__main__":
     # 设置标定板参数
-    pattern_params = init_calibration_params(
-        pattern_cols=11,    
-        pattern_rows=8,     
-        square_size=0.035   
-    )
+    pattern_params = init_calibration_params()
     
     # 使用绝对路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    images_path = os.path.join(current_dir, 'collect_data_in')
-    arm_pose_file = os.path.join(current_dir, 'collect_data_in', 'poses.txt')
+    images_path = os.path.join(current_dir, CALIBRATION_DATA_DIR)
+    arm_pose_file = os.path.join(current_dir, CALIBRATION_DATA_DIR, 'poses.txt')
 
     # 检查文件夹和文件是否存在
     if not os.path.exists(images_path):
@@ -290,7 +306,7 @@ if __name__ == "__main__":
             
             # 为了兼容性，也单独保存各个矩阵
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            output_dir = os.path.join(current_dir, 'measured_data_in')
+            output_dir = os.path.join(current_dir, CALIBRATION_OUTPUT_DIR)
             os.makedirs(output_dir, exist_ok=True)
 
             for name, matrix in matrices.items():

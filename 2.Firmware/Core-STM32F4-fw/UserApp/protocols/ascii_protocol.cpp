@@ -7,7 +7,7 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
 {
     /*---------------------------- ↓ Add Your CMDs Here ↓ -----------------------------*/
     uint8_t argNum;//加
-    if (_cmd[0] == '!' || !dummy.IsEnabled())
+    if (_cmd[0] == '!')
     {
         std::string s(_cmd);
         if (s.find("STOP") != std::string::npos)
@@ -64,11 +64,11 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
                 Respond(_responseChannel, "Grip angle %.2f", angle);
             }
         }
-    } else if (_cmd[0] == '>' || _cmd[0] == '@')
+    } else if ((_cmd[0] == '>' || _cmd[0] == '@') && dummy.IsEnabled())
     {
         uint32_t freeSize = dummy.commandHandler.Push(_cmd);
         Respond(_responseChannel, "%d", freeSize);
-    }else if (_cmd[0] == '&')//加
+    }else if (_cmd[0] == '&' && dummy.IsEnabled())//加
     {
         float joints[6];
         float speed;

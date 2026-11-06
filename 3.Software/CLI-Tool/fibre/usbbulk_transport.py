@@ -7,7 +7,6 @@ import sys
 import time
 import fibre.protocol
 import traceback
-import platform
 from fibre.utils import TimeoutError
 
 # Currently we identify fibre-enabled devices by VID,PID
@@ -41,13 +40,9 @@ class USBBulkTransport(fibre.protocol.PacketSource, fibre.protocol.PacketSink):
     return string
 
   def init(self):
-    # Under some conditions, the Linux USB/libusb stack ends up in a corrupt
-    # state where there are a few packets in a receive queue but a call
-    # to epr.read() does not return these packet until a new packet arrives.
-    # This undesirable queue can be cleared by resetting the device.
-    # On windows this would cause file-not-found errors in subsequent dev calls
-    if platform.system() != 'Windows':
-        self.dev.reset()
+    # Do not reset the whole USB device here. This controller is composite
+    # (CDC plus Fibre); resetting it during discovery tears down both
+    # interfaces and forces the host to enumerate it again.
 
     #self.dev.set_configuration() # no args: set first configuration
 
