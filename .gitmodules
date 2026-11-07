@@ -1,3 +1,6 @@
 [submodule "3.Software/DummyGraspnet"]
 	path = 3.Software/DummyGraspnet
 	url = https://github.com/XiaoHai11111/DummyGraspnet.git
+[submodule "3.Software/DummyMujoco"]
+	path = 3.Software/DummyMujoco
+	url = https://github.com/XiaoHai11111/DummyMujoco.git
