@@ -1,0 +1,53 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "serial": {
+    "default_port": "/dev/ttyACM0",
+    "baudrate": 115200,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "read_timeout_s": 0.15,
+    "command_timeout_s": 2.0,
+    "operation_timeout_s": 45.0,
+    "poll_interval_ms": 400
+  },
+  "robot": {
+    "joint_speed_deg_s": 100,
+    "joint_tolerance_deg": 1.5,
+    "joint_command_deadband_deg": 0.2,
+    "homing_pose_deg": [0, 0, 90, 0, 0, 0],
+    "resting_pose_deg": [0, -75, 180, 0, 0, 0],
+    "initial_gripper_angle_deg": 0,
+    "joints": [
+      {"name": "Joint1", "min_deg": -170, "max_deg": 170, "model_joint": "joint1", "model_sign": 1, "model_offset_deg": 0},
+      {"name": "Joint2", "min_deg": -75, "max_deg": 90, "model_joint": "joint2", "model_sign": 1, "model_offset_deg": 0},
+      {"name": "Joint3", "min_deg": 35, "max_deg": 180, "model_joint": "joint3", "model_sign": 1, "model_offset_deg": -90},
+      {"name": "Joint4", "min_deg": -180, "max_deg": 180, "model_joint": "joint4", "model_sign": 1, "model_offset_deg": 0},
+      {"name": "Joint5", "min_deg": -120, "max_deg": 120, "model_joint": "joint5", "model_sign": 1, "model_offset_deg": 0},
+      {"name": "Joint6", "min_deg": -720, "max_deg": 720, "model_joint": "joint6", "model_sign": 1, "model_offset_deg": 0}
+    ],
+    "gripper": {
+      "name": "Gripper",
+      "min_deg": 0,
+      "max_deg": 45,
+      "open_angle_deg": 45,
+      "closed_angle_deg": 0,
+      "model_joints": ["finger_left_joint", "finger_right_joint"],
+      "model_open_rad": 0.78
+    }
+  },
+  "camera": {
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "jpeg_quality": 82
+  },
+  "models": {
+    "urdf": "../DummyMujoco/dummy_description/urdf/dummy_gripper.urdf",
+    "mjcf": "../DummyMujoco/dummy_description/mjcf/dummy.xml",
+    "mesh_dir": "../DummyMujoco/dummy_description/meshes"
+  }
+}

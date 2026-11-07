@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#071018" />
+  <title>DUMMY / ROBOT CONTROL</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script type="importmap">
+    {"imports":{"three":"/vendor/three.module.js","three/addons/":"/vendor/jsm/"}}
+  </script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark"><span></span><span></span><span></span></div>
+        <div><div class="brand-title">DUMMY<span>/</span>CONTROL</div><div class="brand-sub">ROBOTICS CONSOLE <i>LOCAL LINK</i></div></div>
+      </div>
+      <div class="system-indicators">
+        <div class="indicator"><span class="led" id="serverLed"></span><span>HOST</span><b id="hostStatus">LOCAL</b></div>
+        <div class="indicator"><span class="led led-muted" id="robotLed"></span><span>ARM</span><b id="robotStatus">OFFLINE</b></div>
+        <div class="indicator"><span class="led led-muted" id="cameraLed"></span><span>DEPTH CAM</span><b id="cameraStatus">OFFLINE</b></div>
+        <div class="clock" id="clock">--:--:--</div>
+      </div>
+    </header>
+
+    <main class="dashboard">
+      <aside class="left-column">
+        <section class="panel connection-panel">
+          <div class="panel-heading"><div><span class="eyebrow">01 / SERIAL LINK</span><h2>机械臂连接</h2></div><span class="panel-icon">⎓</span></div>
+          <div class="field-row port-row">
+            <label for="portSelect">端口</label>
+            <select id="portSelect"><option value="">扫描设备中…</option></select>
+            <button class="icon-button" id="scanPorts" title="扫描串口">⟳</button>
+          </div>
+          <div class="serial-grid">
+            <div class="field"><label for="baudrate">波特率</label><select id="baudrate"><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option selected>115200</option><option>230400</option><option>460800</option><option>921600</option></select></div>
+            <div class="field"><label for="bytesize">数据位</label><select id="bytesize"><option>5</option><option>6</option><option>7</option><option selected>8</option></select></div>
+            <div class="field"><label for="parity">校验位</label><select id="parity"><option value="N" selected>None</option><option value="E">Even</option><option value="O">Odd</option></select></div>
+            <div class="field"><label for="stopbits">停止位</label><select id="stopbits"><option value="1" selected>1</option><option value="1.5">1.5</option><option value="2">2</option></select></div>
+          </div>
+          <button class="button button-primary button-wide" id="connectRobot"><span class="button-glyph">⟷</span><span>连接机械臂</span></button>
+          <div class="micro-note"><span class="tiny-dot"></span>USB CDC · ASCII protocol · 8N1</div>
+        </section>
+
+        <section class="panel command-panel">
+          <div class="panel-heading compact">
+            <div><span class="eyebrow">02 / ASCII TERMINAL</span><h2>串口指令</h2></div>
+            <span class="camera-tag">USB CDC</span>
+          </div>
+          <label class="command-label" for="asciiCommand">输入一条固件指令</label>
+          <div class="command-input-row">
+            <input id="asciiCommand" class="command-input" type="text" maxlength="128"
+                   placeholder="#GETJPOS" autocomplete="off" spellcheck="false" disabled />
+            <button class="button button-primary command-send" id="sendAsciiCommand" disabled>发送</button>
+          </div>
+          <div class="command-hint">例如 #GETJPOS · 回车发送 · 运动指令要求已使能</div>
+          <div class="command-history" id="commandHistory" aria-live="polite">
+            <div class="command-placeholder">等待指令；支持列表见 README</div>
+          </div>
+          <div class="command-safety">运动、夹爪和使能指令会二次确认；STOP 可直接发送。</div>
+        </section>
+
+        <section class="panel camera-panel">
+          <div class="panel-heading"><div><span class="eyebrow">03 / VISION SENSOR</span><h2>D435 深度相机</h2></div><span class="camera-tag">RGB-D</span></div>
+          <div class="camera-preview" id="cameraBox">
+            <div class="camera-scanline"></div>
+            <img id="cameraFeed" alt="RealSense camera preview" />
+            <div class="camera-placeholder" id="cameraPlaceholder"><div class="camera-crosshair">⌖</div><span>NO CAMERA STREAM</span><small>Connect sensor to begin</small></div>
+            <div class="camera-overlay"><span id="cameraResolution">640 × 480</span><span><i class="rec-dot"></i> LIVE</span></div>
+          </div>
+          <div class="camera-info"><span>DEVICE <b id="cameraDevice">Intel RealSense</b></span><span>DEPTH <b id="cameraDepth">—</b></span></div>
+          <button class="button button-outline button-wide" id="connectCamera"><span class="button-glyph">◉</span><span>连接相机</span></button>
+        </section>
+
+      </aside>
+
+      <section class="center-column">
+        <section class="panel viewport-panel">
+          <div class="viewport-topline"><div><span class="eyebrow">LIVE KINEMATICS</span><h2>机械臂数字孪生</h2></div><div class="viewport-tools"><span class="view-chip" id="modelState">MODEL LOADING</span><button class="icon-button" id="resetView" title="重置视角">⌖</button></div></div>
+          <div class="robot-viewport" id="robotViewport">
+            <div class="viewport-glow"></div>
+            <div class="viewport-watermark">DUMMY<br><span>6-AXIS SYSTEM</span></div>
+            <div class="view-axis"><span>X</span><span>Y</span><span>Z</span></div>
+            <div class="model-loading" id="modelLoading"><div class="loader-ring"></div><span>正在构建运动学模型</span></div>
+            <div class="model-error hidden" id="modelError"></div>
+            <canvas id="robotCanvas"></canvas>
+          </div>
+          <div class="viewport-footer"><div class="legend"><span><i class="legend-dot actual"></i>ACTUAL POSITION</span><span><i class="legend-dot target"></i>JOINT TARGET</span></div><div class="coordinate-readout" id="poseReadout">TCP X — · Y — · Z — mm</div></div>
+        </section>
+
+        <section class="panel telemetry-panel">
+          <div class="panel-heading compact"><div><span class="eyebrow">TELEMETRY / FEEDBACK</span><h2>末端实时位姿</h2></div><span class="refresh-indicator"><i></i> AUTO POLL</span></div>
+          <div class="pose-grid">
+            <div class="pose-cell"><span>X</span><b id="poseX">—</b><small>mm</small></div>
+            <div class="pose-cell"><span>Y</span><b id="poseY">—</b><small>mm</small></div>
+            <div class="pose-cell"><span>Z</span><b id="poseZ">—</b><small>mm</small></div>
+            <div class="pose-cell pose-angle"><span>A</span><b id="poseA">—</b><small>deg</small></div>
+            <div class="pose-cell pose-angle"><span>B</span><b id="poseB">—</b><small>deg</small></div>
+            <div class="pose-cell pose-angle"><span>C</span><b id="poseC">—</b><small>deg</small></div>
+          </div>
+          <div class="telemetry-foot"><span id="telemetryMessage">等待机械臂反馈</span><span>FRAME <b>BASE / TCP</b></span></div>
+        </section>
+      </section>
+
+      <aside class="right-column">
+        <section class="panel controls-panel">
+          <div class="panel-heading"><div><span class="eyebrow">04 / MANUAL CONTROL</span><h2>关节控制</h2></div><span class="control-state" id="controlState">LOCKED</span></div>
+          <div class="joint-list" id="jointControls"></div>
+          <div class="gripper-control">
+            <div class="gripper-head"><div><span class="eyebrow">END EFFECTOR</span><h3>夹爪开合</h3></div><strong><span id="gripperValue">0.0</span><small>°</small></strong></div>
+            <div class="slider-wrap gripper-slider"><input id="gripperSlider" type="range" min="0" max="45" step="0.5" value="0" disabled /><div class="range-labels"><span>CLOSE</span><span>OPEN</span></div></div>
+            <div class="gripper-buttons"><button class="button button-outline" id="gripperClose" disabled>关闭夹爪</button><button class="button button-outline" id="gripperOpen" disabled>打开夹爪</button></div>
+            <div class="micro-note">夹爪显示最后指令角；当前协议无角度回读</div>
+          </div>
+          <div class="control-actions">
+            <button class="button button-enable" id="enableRobot" disabled><span class="button-glyph">⏻</span><span>使能</span></button>
+            <button class="button button-danger" id="stopRobot" disabled title="停止运动">■ STOP</button>
+          </div>
+          <div class="pose-actions">
+            <button class="button button-outline" id="homeRobot" disabled><span>⌂</span> Homing</button>
+            <button class="button button-outline" id="restRobot" disabled><span>↺</span> Resting</button>
+          </div>
+          <div class="safety-hint"><span>!</span><div>关节滑块松开后发送目标角度。先确认工作区域无人，再使能控制。</div></div>
+        </section>
+
+        <section class="panel console-panel">
+          <div class="panel-heading compact"><div><span class="eyebrow">SYSTEM LOG</span><h2>事件记录</h2></div><button class="text-button" id="clearLog">CLEAR</button></div>
+          <div class="log-list" id="logList"><div class="log-entry muted"><time>--:--:--</time><span>DummyWeb console ready.</span></div></div>
+        </section>
+      </aside>
+    </main>
+    <footer class="footer"><span>DummyRobot · LOCAL CONTROL BRIDGE</span><span>CONFIG <b>/3.Software/DummyWeb/config.json</b></span><span id="serverAddress">127.0.0.1:8765</span></footer>
+  </div>
+  <div class="toast-stack" id="toastStack"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
