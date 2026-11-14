@@ -11,6 +11,8 @@ const app = {
   targetJoints: [0, 0, 90, 0, 0, 0],
   lastCommandedTargets: null,
   sliderActive: new Set(),
+  jointSendTimer: null,
+  statusPolling: false,
   pendingMove: false,
   jointCommandQueued: false,
   commandBusy: false,
@@ -188,14 +190,27 @@ function createJointControls() {
       app.sliderActive.add(index);
       app.targetJoints[index] = Number(slider.value);
       updateJointReadout(index);
+      scheduleJointTargets();
     });
     slider.addEventListener('change', async () => {
       app.sliderActive.delete(index);
+      if (app.jointSendTimer) {
+        window.clearTimeout(app.jointSendTimer);
+        app.jointSendTimer = null;
+      }
       await sendJointTargets();
     });
     row.append(head, slider);
     container.append(row);
   });
+}
+
+function scheduleJointTargets() {
+  if (app.jointSendTimer) return;
+  app.jointSendTimer = window.setTimeout(() => {
+    app.jointSendTimer = null;
+    sendJointTargets();
+  }, 100);
 }
 
 function updateJointReadout(index) {
@@ -283,6 +298,8 @@ function applyCameraStatus(camera) {
 }
 
 async function pollStatus() {
+  if (app.statusPolling) return;
+  app.statusPolling = true;
   try {
     const data = await api('/status');
     app.config = data.config;
@@ -291,6 +308,8 @@ async function pollStatus() {
   } catch (error) {
     $('hostStatus').textContent = 'BRIDGE LOST';
     setLed('serverLed', false);
+  } finally {
+    app.statusPolling = false;
   }
 }
 
@@ -663,7 +682,7 @@ async function boot() {
     initGripper();
     initCamera();
     await pollStatus();
-    setInterval(pollStatus, Math.max(300, Number(app.config.serial.poll_interval_ms)));
+    setInterval(pollStatus, Math.max(80, Number(app.config.serial.poll_interval_ms)));
     $('hostStatus').textContent = 'LOCAL';
     setLed('serverLed', true);
     log(`控制台就绪 · 关节速度 ${app.config.robot.joint_speed_deg_s}°/s`, 'success');
