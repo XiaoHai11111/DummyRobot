@@ -57,3 +57,5 @@ release/
 
 # Git 特殊文件
 !.gitignore
+
+hand_in/collect_data_in_dummyrobot.bak.*

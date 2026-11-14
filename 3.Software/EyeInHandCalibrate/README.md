@@ -67,6 +67,25 @@ python hand_in_eye_calibrate.py
 
 在手眼标定结束后可进入Acc_test文件夹，修改main.py中的各项数据，运行main.py进行手眼标定结果的验证；此验证仅适用于UR5与D435相机结合的项目，如果需要测试自己的项目，请自行替换相机文件（realsenseD435.py）与机器人文件（UR_Robot.py）。
 
+针对 DummyRobot 的验证脚本为 `Acc_test/dummyrobot_acc_test.py`，直接复用 `DummyGraspnet/dummyrobot_adapter.py` 的 `DummyRobotVCP` 与单位换算，坐标按眼在手上的正确链式关系 `T_base_end @ T_end_camera @ p_camera` 计算。在 `DummyRobot` 环境中运行：
+
+```bash
+conda activate DummyRobot
+cd 3.Software/EyeInHandCalibrate/Acc_test
+python dummyrobot_acc_test.py              # 干运行：点击打印坐标，不发送运动
+python dummyrobot_acc_test.py --execute    # 点击后逐个确认，才使能并 MoveL 到位
+```
+
+默认读取 `hand_in/measured_data_in_dummyrobot/` 的手眼结果与相机内参，并用 `--handeye` 覆盖路径；相机默认 1280×720 与标定分辨率一致。不加 `--execute` 时是纯干运行，可从不同机械臂位姿点击同一个物理点，再按 `p` 得到各次估算基座坐标的一致性误差（量化手眼外参）；加 `--execute` 后每次点击仍需输入 `MOVE` 确认，程序先使能、MoveL 到预抓取点→目标点→读回末端位姿打印运动误差，再回到预抓取点。运行前清空周边空间、保持急停可触及并全程观察。
+
+另提供离线残差脚本 `Acc_test/offline_handeye_residual.py`，只依赖 numpy/opencv，不接实机和相机。它用已采集的棋盘图 + `poses.txt` + 已保存标定结果计算三个量化指标：相机 2D 重投影误差、手眼 AX=XB 残差、棋盘基座系一致性，可用来在重新标定后离线验收，并定位坏样本：
+
+```bash
+conda activate DummyRobot
+cd 3.Software/EyeInHandCalibrate/Acc_test
+python offline_handeye_residual.py
+```
+
 # Tips
 
 collect_data_in和collect_data_out文件夹中都有示例图片，可以直接运行理解代码。
