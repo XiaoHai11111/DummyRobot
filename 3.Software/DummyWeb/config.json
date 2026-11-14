@@ -15,7 +15,7 @@
     "poll_interval_ms": 400
   },
   "robot": {
-    "joint_speed_deg_s": 100,
+    "joint_speed_deg_s": 75,
     "joint_tolerance_deg": 1.5,
     "joint_command_deadband_deg": 0.2,
     "homing_pose_deg": [0, 0, 90, 0, 0, 0],
