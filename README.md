@@ -176,3 +176,13 @@ Dummy固件支持三种不同的指令模式（指令可以由USB、串口、CAN
 > * [olikraus/u8g2: U8glib library for monochrome displays, version 2 (github.com)](https://github.com/olikraus/u8g2)
 > * [samuelsadok/fibre: Abstraction layer for painlessly building object oriented distributed systems that just work (github.com)](https://github.com/samuelsadok/fibre)
 
+## Git Message模板
+
+```
+Feature/Fix:新增功能/修复内容(尽量总结至20字以内)
+	修改描述：
+		why:(总结至30字以内)
+		how:(总结至30字以内)
+	影响范围：(总结至50字以内)
+```
+
