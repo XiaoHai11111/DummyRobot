@@ -4,3 +4,9 @@
 [submodule "3.Software/DummyMujoco"]
 	path = 3.Software/DummyMujoco
 	url = https://github.com/XiaoHai11111/DummyMujoco.git
+[submodule "0.SubModules/DummyPeak"]
+	path = 0.SubModules/DummyPeak
+	url = https://github.com/XiaoHai11111/DummyPeak.git
+[submodule "0.SubModules/FlexGrip"]
+	path = 0.SubModules/FlexGrip
+	url = https://github.com/XiaoHai11111/FlexGrip.git
