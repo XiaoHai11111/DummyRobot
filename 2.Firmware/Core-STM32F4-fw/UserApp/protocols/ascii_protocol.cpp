@@ -1,242 +1,147 @@
 #include "common_inc.h"
+#include "instances/motion_command.h"
 
 extern DummyRobot dummy;
 
-
-void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
+// USB and UART4 intentionally share the exact same command semantics.
+static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
 {
-    /*---------------------------- ↓ Add Your CMDs Here ↓ -----------------------------*/
-    uint8_t argNum;//加
-    if (_cmd[0] == '!')
+    if (!len) return;
+    std::string text(cmd, len);
+    while (!text.empty() && isspace(static_cast<unsigned char>(text.back()))) text.pop_back();
+    cmd = text.c_str();
+    if (text == "!STOP")
     {
-        std::string s(_cmd);
-        if (s.find("STOP") != std::string::npos)
+        dummy.commandHandler.EmergencyStop();
+        Respond(response, "Stopped ok");
+    } else if (text == "!START")
+    {
+        dummy.SetEnable(true);
+        if (dummy.IsEnabled())
         {
-            dummy.commandHandler.EmergencyStop();
-            Respond(_responseChannel, "Stopped ok");
-        } else if (s.find("START") != std::string::npos)
-        {
-            dummy.SetEnable(true);
             dummy.hand->SetEnable(true);
-            Respond(_responseChannel, "Started ok");
-        } else if (s.find("DISABLE") != std::string::npos)
-        {
-            dummy.SetEnable(false);
-            dummy.hand->SetEnable(false);
-            Respond(_responseChannel, "Disabled ok");
-        }
-    } else if (_cmd[0] == '#')
+            Respond(response, "Started ok");
+        } else
+            Respond(response, "error start blocked: check #GETSTATUS / !CLEARFAULT");
+    } else if (text == "!DISABLE")
     {
-        std::string s(_cmd);
-        if (s.find("GETJPOS") != std::string::npos)
+        dummy.SetEnable(false);
+        dummy.hand->SetEnable(false);
+        Respond(response, "Disabled ok");
+    } else if (text == "!CLEARFAULT")
+    {
+        Respond(response, dummy.ClearFaults() ? "Faults cleared ok" :
+                "error clear failed: disable first, check drivers/CAN");
+    } else if (text == "#GETSTATUS")
+    {
+        Respond(response, "oks %u %u %u %u %u %u %u %u %u",
+                unsigned(dummy.IsEnabled()), unsigned(dummy.commandMode), unsigned(dummy.GetFaultJointMask()),
+                unsigned(dummy.GetJointFault(1)), unsigned(dummy.GetJointFault(2)),
+                unsigned(dummy.GetJointFault(3)), unsigned(dummy.GetJointFault(4)),
+                unsigned(dummy.GetJointFault(5)), unsigned(dummy.GetJointFault(6)));
+    } else if (text == "#GETCAN")
+    {
+        const auto ctx = get_can_ctx(&hcan1);
+        Respond(response, "okc %lu %lu %lu %lu %lu %lu",
+                static_cast<unsigned long>(ctx->received_msg_cnt),
+                static_cast<unsigned long>(ctx->tx_msg_cnt),
+                static_cast<unsigned long>(ctx->unexpected_errors),
+                static_cast<unsigned long>(ctx->TxMailboxAbortCallbackCnt),
+                static_cast<unsigned long>(ctx->last_error),
+                static_cast<unsigned long>(ctx->bus_error_status));
+    } else if (text.rfind("#GETDRV ", 0) == 0)
+    {
+        unsigned joint;
+        char extra;
+        if (sscanf(cmd, "#GETDRV %u %c", &joint, &extra) != 1 || joint < 1 || joint > 6)
+            Respond(response, "error invalid joint (1..6)");
+        else
         {
-            Respond(_responseChannel, "okj %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentJoints.a[0], dummy.currentJoints.a[1],
-                    dummy.currentJoints.a[2], dummy.currentJoints.a[3],
-                    dummy.currentJoints.a[4], dummy.currentJoints.a[5]);
-        } else if (s.find("GETLPOS") != std::string::npos)
+            const auto motor = dummy.motorJ[joint];
+            Respond(response, "okd %u %lu %u %u %u %lu %lu", joint,
+                    static_cast<unsigned long>(motor->feedbackReceived ? motor->FeedbackAge() : UINT32_MAX),
+                    unsigned(motor->driverState), unsigned(motor->faultFlags), unsigned(dummy.GetJointFault(joint)),
+                    static_cast<unsigned long>(dummy.GetFaultFeedbackAge(joint)),
+                    static_cast<unsigned long>(motor->feedbackCount));
+        }
+    } else if (text.rfind("#GETTIMING ", 0) == 0)
+    {
+        unsigned joint;
+        char extra;
+        if (sscanf(cmd, "#GETTIMING %u %c", &joint, &extra) != 1 || joint < 1 || joint > 6)
+            Respond(response, "error invalid joint (1..6)");
+        else
         {
-            dummy.UpdateJointPose6D();
-            Respond(_responseChannel, "okl %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentPose6D.X, dummy.currentPose6D.Y,
-                    dummy.currentPose6D.Z, dummy.currentPose6D.A,
-                    dummy.currentPose6D.B, dummy.currentPose6D.C);
-        } else if (s.find("CMDMODE") != std::string::npos)
+            const auto motor = dummy.motorJ[joint];
+            if (!motor->ReadControlTiming())
+                Respond(response, "error F1 timing response timeout (update F1)");
+            else
+                Respond(response, "okt %u %u %u %lu", joint, unsigned(motor->controlLastCycles),
+                        unsigned(motor->controlMaxCycles), static_cast<unsigned long>(motor->controlOverruns));
+        }
+    } else if (text == "#GETJPOS")
+    {
+        Respond(response, "okj %.2f %.2f %.2f %.2f %.2f %.2f",
+                dummy.currentJoints.a[0], dummy.currentJoints.a[1], dummy.currentJoints.a[2],
+                dummy.currentJoints.a[3], dummy.currentJoints.a[4], dummy.currentJoints.a[5]);
+    } else if (text == "#GETLPOS")
+    {
+        Respond(response, "okl %.2f %.2f %.2f %.2f %.2f %.2f",
+                dummy.currentPose6D.X, dummy.currentPose6D.Y, dummy.currentPose6D.Z,
+                dummy.currentPose6D.A, dummy.currentPose6D.B, dummy.currentPose6D.C);
+    } else if (text.rfind("#CMDMODE ", 0) == 0)
+    {
+        unsigned long mode;
+        char extra;
+        if (sscanf(cmd, "#CMDMODE %lu %c", &mode, &extra) != 1 || mode < 1 || mode > 4)
+            Respond(response, "error invalid mode (1=SEQ 2=INT 3=TRJ 4=TUN)");
+        else
         {
-            uint32_t mode;
-            sscanf(_cmd, "#CMDMODE %lu", &mode);
             dummy.SetCommandMode(mode);
-            Respond(_responseChannel, "Set command mode to [%lu]", mode);
-        } else if (s.rfind("#GRIP_CURRENT", 0) == 0)
-        {
-            float current;
-            if (sscanf(_cmd, "#GRIP_CURRENT %f", &current) == 1)
-            {
-                dummy.hand->SetMaxCurrent(current);
-                Respond(_responseChannel, "Grip current %.2f", current);
-            }
-        } else if (s.rfind("#GRIP", 0) == 0)
-        {
-            float angle;
-            if (sscanf(_cmd, "#GRIP %f", &angle) == 1)
-            {
-                dummy.hand->SetAngle(angle);
-                Respond(_responseChannel, "Grip angle %.2f", angle);
-            }
+            Respond(response, "Set command mode to [%lu]", mode);
         }
-    } else if ((_cmd[0] == '>' || _cmd[0] == '@') && dummy.IsEnabled())
+    } else if (text.rfind("#GRIP", 0) == 0)
     {
-        uint32_t freeSize = dummy.commandHandler.Push(_cmd);
-        Respond(_responseChannel, "%d", freeSize);
-    }else if (_cmd[0] == '&' && dummy.IsEnabled())//加
-    {
-        float joints[6];
-        float speed;
-        float hangle;
-        float hcurrent;
-
-        argNum = sscanf(_cmd, "&%f,%f,%f,%f,%f,%f,%f,%f,%f", joints, joints + 1, joints + 2,
-                        joints + 3, joints + 4, joints + 5, &speed, &hangle, &hcurrent);
-        if (argNum == 6)
+        float value;
+        char extra;
+        const bool current = text.rfind("#GRIP_CURRENT ", 0) == 0;
+        const char* format = current ? "#GRIP_CURRENT %f %c" : "#GRIP %f %c";
+        if (!dummy.IsEnabled() || dummy.HasFault())
+            Respond(response, "error robot disabled or faulted");
+        else if (sscanf(cmd, format, &value, &extra) != 1 || !MotionFinite(value) ||
+                 value < 0 || value > (current ? 1.0f : 45.0f))
+            Respond(response, "error invalid gripper parameter");
+        else if (current)
         {
-            dummy.MoveJ(joints[0], joints[1], joints[2],
-                        joints[3], joints[4], joints[5]);
-        } else if (argNum == 7)
+            dummy.hand->SetMaxCurrent(value);
+            Respond(response, "Grip current %.2f", value);
+        } else
         {
-            dummy.SetJointSpeed(speed);
-            dummy.MoveJ(joints[0], joints[1], joints[2],
-                        joints[3], joints[4], joints[5]);
-        } else if (argNum == 8)
-        {
-            dummy.SetJointSpeed(speed);
-            dummy.MoveJ(joints[0], joints[1], joints[2],
-                        joints[3], joints[4], joints[5]);
-            dummy.hand->SetAngle(hangle);
-        } else if (argNum == 9)
-        {
-            dummy.SetJointSpeed(speed);
-            dummy.MoveJ(joints[0], joints[1], joints[2],
-                        joints[3], joints[4], joints[5]);
-            dummy.hand->SetAngle(hangle);
-            dummy.hand->SetMaxCurrent(hcurrent);
+            dummy.hand->SetAngle(value);
+            Respond(response, "Grip angle %.2f", value);
         }
-
-        Respond(_responseChannel, "ok");
-
-    }else if (_cmd[0] == '@')//加
+    } else if ((cmd[0] == '>' || cmd[0] == '@') && dummy.IsEnabled())
     {
-        float pose[6];
-        float speed;
-
-        argNum = sscanf(_cmd, "@%f,%f,%f,%f,%f,%f,%f", pose, pose + 1, pose + 2,
-                        pose + 3, pose + 4, pose + 5, &speed);
-        if (argNum == 6)
-        {
-            dummy.MoveL(pose[0], pose[1], pose[2],
-                        pose[3], pose[4], pose[5]);
-        } else if (argNum == 7)
-        {
-            dummy.SetJointSpeed(speed);
-            dummy.MoveL(pose[0], pose[1], pose[2],
-                        pose[3], pose[4], pose[5]);
-        }
-        Respond(_responseChannel, "ok");
-    }
-
-/*---------------------------- ↑ Add Your CMDs Here ↑ -----------------------------*/
+        const uint32_t freeSize = dummy.commandHandler.Push(text, &response);
+        if (freeSize == 0xFF)
+            Respond(response, "error invalid motion, queue full or faulted");
+        else
+            Respond(response, "%lu", static_cast<unsigned long>(freeSize));
+    } else
+        Respond(response, "error unknown command or robot disabled");
 }
 
-
-void OnUart4AsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
+void OnUsbAsciiCmd(const char* cmd, size_t len, StreamSink &response)
 {
-    /*---------------------------- ↓ Add Your CMDs Here ↓ -----------------------------*/
-    uint8_t argNum;//加
-    if (_cmd[0] == '!')
-    {
-        std::string s(_cmd);
-        if (s.find("STOP") != std::string::npos)
-        {
-            dummy.commandHandler.EmergencyStop();
-            Respond(_responseChannel, "Stopped ok");
-        } else if (s.find("START") != std::string::npos)
-        {
-            dummy.SetEnable(true);
-            Respond(_responseChannel, "Started ok");
-        } else if (s.find("DISABLE") != std::string::npos)
-        {
-            dummy.SetEnable(false);
-            Respond(_responseChannel, "Disabled ok");
-        }
-    } else if (_cmd[0] == '#')
-    {
-        std::string s(_cmd);
-        if (s.find("GETJPOS") != std::string::npos)
-        {
-            Respond(_responseChannel, "okj %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentJoints.a[0], dummy.currentJoints.a[1],
-                    dummy.currentJoints.a[2], dummy.currentJoints.a[3],
-                    dummy.currentJoints.a[4], dummy.currentJoints.a[5]);
-        } else if (s.find("GETLPOS") != std::string::npos)
-        {
-            dummy.UpdateJointPose6D();
-            Respond(_responseChannel, "okl %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentPose6D.X, dummy.currentPose6D.Y,
-                    dummy.currentPose6D.Z, dummy.currentPose6D.A,
-                    dummy.currentPose6D.B, dummy.currentPose6D.C);
-        } else if (s.find("CMDMODE") != std::string::npos)
-        {
-            uint32_t mode;
-            sscanf(_cmd, "#CMDMODE %lu", &mode);
-            dummy.SetCommandMode(mode);
-            Respond(_responseChannel, "Set command mode to [%lu]", mode);
-        } else if (s.rfind("#GRIP_CURRENT", 0) == 0)
-        {
-            float current;
-            if (sscanf(_cmd, "#GRIP_CURRENT %f", &current) == 1)
-            {
-                dummy.hand->SetMaxCurrent(current);
-                Respond(_responseChannel, "Grip current %.2f", current);
-            }
-        } else if (s.rfind("#GRIP", 0) == 0)
-        {
-            float angle;
-            if (sscanf(_cmd, "#GRIP %f", &angle) == 1)
-            {
-                dummy.hand->SetAngle(angle);
-                Respond(_responseChannel, "Grip angle %.2f", angle);
-            }
-        }
-    } else if (_cmd[0] == '>' || _cmd[0] == '@')
-    {
-        uint32_t freeSize = dummy.commandHandler.Push(_cmd);
-        Respond(_responseChannel, "%d", freeSize);
-    }else if (_cmd[0] == '&' && dummy.IsEnabled())//加
-    {
-        float joints[6];
-        float speed;
-
-        argNum = sscanf(_cmd, "&%f,%f,%f,%f,%f,%f,%f", joints, joints + 1, joints + 2,
-                        joints + 3, joints + 4, joints + 5, &speed);
-        if (argNum == 6)
-        {
-            dummy.MoveJ(joints[0], joints[1], joints[2],
-                        joints[3], joints[4], joints[5]);
-        } else if (argNum == 7)
-        {
-            dummy.SetJointSpeed(speed);
-            dummy.MoveJ(joints[0], joints[1], joints[2],
-                        joints[3], joints[4], joints[5]);
-        }
-
-        Respond(_responseChannel, "ok");
-
-    }else if (_cmd[0] == '@' && dummy.IsEnabled())//加
-    {
-        float pose[6];
-        float speed;
-
-        argNum = sscanf(_cmd, "@%f,%f,%f,%f,%f,%f,%f", pose, pose + 1, pose + 2,
-                        pose + 3, pose + 4, pose + 5, &speed);
-        if (argNum == 6)
-        {
-            dummy.MoveL(pose[0], pose[1], pose[2],
-                        pose[3], pose[4], pose[5]);
-        } else if (argNum == 7)
-        {
-            dummy.SetJointSpeed(speed);
-            dummy.MoveL(pose[0], pose[1], pose[2],
-                        pose[3], pose[4], pose[5]);
-        }
-
-        Respond(_responseChannel, "ok");
-    }
-/*---------------------------- ↑ Add Your CMDs Here ↑ -----------------------------*/
+    OnRobotAsciiCmd(cmd, len, response);
 }
 
-
-void OnUart5AsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
+void OnUart4AsciiCmd(const char* cmd, size_t len, StreamSink &response)
 {
-    /*---------------------------- ↓ Add Your CMDs Here ↓ -----------------------------*/
+    OnRobotAsciiCmd(cmd, len, response);
+}
 
-/*---------------------------- ↑ Add Your CMDs Here ↑ -----------------------------*/
+void OnUart5AsciiCmd(const char* cmd, size_t len, StreamSink &response)
+{
+    // UART5 is reserved for application-specific peripherals.
 }

@@ -26,6 +26,7 @@ CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 JOINT_RESPONSE = re.compile(r"^okj\s+([-+\d.eE]+(?:\s+[-+\d.eE]+){5})$")
 POSE_RESPONSE = re.compile(r"^okl\s+([-+\d.eE]+(?:\s+[-+\d.eE]+){5})$")
+STATUS_RESPONSE = re.compile(r"^oks\s+([01])\s+([1-4])\s+(\d+)" + r"\s+(\d+)" * 6 + r"$")
 FLOAT_TOKEN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 
 
@@ -169,6 +170,8 @@ class RobotLink:
         self.gripper_deg = float(CONFIG["robot"]["initial_gripper_angle_deg"])
         self.busy = ""
         self.last_error = ""
+        self.faults = [0] * 6
+        self.command_mode = None
 
     @property
     def connected(self):
@@ -186,8 +189,7 @@ class RobotLink:
 
     def connect(self, options):
         with self.lock:
-            if self.connected:
-                self.device.close()
+            self.disconnect()
             bytesizes = {5: serial.FIVEBITS, 6: serial.SIXBITS,
                          7: serial.SEVENBITS, 8: serial.EIGHTBITS}
             stopbits = {1: serial.STOPBITS_ONE, 1.5: serial.STOPBITS_ONE_POINT_FIVE,
@@ -205,19 +207,33 @@ class RobotLink:
                                         timeout=float(CONFIG["serial"]["read_timeout_s"]),
                                         write_timeout=1.0)
             self.port = port
-            self.enabled = False  # state is local; firmware has no ASCII enabled-state query
+            self.enabled = False
+            self.command_mode = None
+            self.faults = [0] * 6
             self.last_error = ""
-            time.sleep(0.15)
-            self.device.reset_input_buffer()
+            try:
+                time.sleep(0.15)
+                # Opening a tty only proves USB enumeration, not that F4 is responding.
+                self.read_status()
+                self.last_error = self.fault_message()
+            except Exception as exc:
+                self.disconnect()
+                self.last_error = f"串口已打开，但 F4 状态握手失败: {exc}"
+                raise RuntimeError(self.last_error) from exc
             return {"connected": True, "port": self.port}
 
     def disconnect(self):
         with self.lock:
-            if self.device and self.device.is_open:
-                self.device.close()
+            device = self.device
             self.device = None
             self.enabled = False
+            self.command_mode = None
             self.port = None
+            if device and device.is_open:
+                try:
+                    device.close()
+                except (serial.SerialException, OSError):
+                    pass
             return {"connected": False}
 
     def _require(self):
@@ -225,24 +241,48 @@ class RobotLink:
             raise RuntimeError("先连接机械臂串口")
 
     def command(self, command, matcher=None, timeout=None):
-        self._require()
         with self.lock:
-            self.device.reset_input_buffer()
-            self.device.write((command + "\r\n").encode("ascii"))
-            self.device.flush()
+            self._require()
+            payload = (command + "\r\n").encode("ascii")
+            try:
+                self.device.reset_input_buffer()
+                written = self.device.write(payload)
+                if written != len(payload):
+                    raise serial.SerialTimeoutException(f"仅写入 {written}/{len(payload)} 字节")
+            except (serial.SerialException, OSError) as exc:
+                self.disconnect()
+                self.last_error = f"串口写入失败（{command}）: {exc}；连接已关闭，请检查 F4 后重新连接"
+                raise RuntimeError(self.last_error) from exc
+            # Wait for the firmware reply. flush()/tcdrain() has no pyserial
+            # write timeout and can block forever on an unresponsive USB device.
             deadline = time.monotonic() + (timeout or float(CONFIG["serial"]["command_timeout_s"]))
             lines = []
             while time.monotonic() < deadline:
-                raw = self.device.readline()
+                try:
+                    raw = self.device.readline()
+                except (serial.SerialException, OSError) as exc:
+                    self.disconnect()
+                    self.last_error = f"串口读取失败（{command}）: {exc}；连接已关闭，请重新连接"
+                    raise RuntimeError(self.last_error) from exc
                 if not raw:
                     continue
                 line = raw.decode("ascii", errors="replace").strip()
                 if not line:
                     continue
                 lines.append(line)
+                if line.startswith("assertion "):
+                    self.disconnect()
+                    self.last_error = f"F4 固件触发运行库断言（{command}）: {line}；通信任务可能已停止，需修复固件后重新上电"
+                    raise RuntimeError(self.last_error)
+                if line.startswith("error") or line == "255":
+                    raise RuntimeError(f"固件拒绝指令: {line}")
                 if matcher is None or matcher(line):
                     return line
-            raise TimeoutError(f"串口命令超时: {command}; 收到: {lines}")
+            # A command may have executed despite a missing ACK. Close without
+            # retrying motion or sending any implicit enable/disable command.
+            self.disconnect()
+            self.last_error = f"F4 回包超时: {command}; 收到: {lines}；连接已关闭，请重新连接"
+            raise TimeoutError(self.last_error)
 
     def read_joints(self):
         line = self.command("#GETJPOS", lambda s: bool(JOINT_RESPONSE.match(s)))
@@ -255,32 +295,73 @@ class RobotLink:
         self.last_pose = [float(v) for v in POSE_RESPONSE.match(line).group(1).split()]
         return self.last_pose
 
+    def read_status(self):
+        line = self.command("#GETSTATUS", lambda value: bool(STATUS_RESPONSE.fullmatch(value)))
+        values = [int(value) for value in STATUS_RESPONSE.fullmatch(line).groups()]
+        self.enabled = bool(values[0])
+        self.command_mode = values[1]
+        self.faults = values[3:]
+        return {"enabled": self.enabled, "command_mode": self.command_mode,
+                "fault_mask": values[2], "faults": self.faults, "reply": line}
+
+    def fault_message(self):
+        names = {1: "过载", 2: "堵转", 4: "编码器未校准", 8: "CAN反馈超时",
+                 16: "F1固件不支持故障协议", 32: "运动超时", 64: "驱动意外停止/重启",
+                 128: "F1控制循环超时"}
+        return "; ".join(f"J{index}: " + "/".join(name for bit, name in names.items() if flags & bit)
+                         for index, flags in enumerate(self.faults, 1) if flags)
+
     def status(self):
         with self.lock:
             state = {"connected": self.connected, "port": self.port,
                      "enabled": self.enabled, "busy": self.busy,
-                     "joints_deg": self.last_joints,
-                     "gripper_deg": self.gripper_deg,
-                     "pose_mm_deg": self.last_pose,
+                     "joints_deg": self.last_joints, "gripper_deg": self.gripper_deg,
+                     "pose_mm_deg": self.last_pose, "faults": self.faults,
                      "error": self.last_error}
             if self.connected:
                 try:
+                    state.update(self.read_status())
                     state["joints_deg"] = self.read_joints()
                     state["pose_mm_deg"] = self.read_pose()
-                    self.last_error = ""
-                    state["error"] = ""
+                    self.last_error = self.fault_message()
                 except Exception as exc:
                     self.last_error = str(exc)
-                    state["error"] = self.last_error
+                    # A missing status reply must not leave the UI claiming READY.
+                    self.enabled = False
+                state["enabled"] = self.enabled
+                state["connected"] = self.connected
+                state["port"] = self.port
+                state["error"] = self.last_error
             return state
+
+    def set_mode(self, mode):
+        line = self.command(f"#CMDMODE {mode}", lambda value: value == f"Set command mode to [{mode}]")
+        self.command_mode = mode
+        return line
 
     def set_enabled(self, enabled):
         self._require()
-        expected = "Started ok" if enabled else "Disabled ok"
-        line = self.command("!START" if enabled else "!DISABLE",
-                            lambda s: expected in s or "ok" in s.lower())
-        self.enabled = bool(enabled)
-        return {"enabled": self.enabled, "reply": line}
+        with self.lock:
+            if enabled:
+                self.read_status()
+                if any(self.faults):
+                    raise RuntimeError(self.fault_message() + "; 排除原因后清除故障")
+                self.set_mode(2)
+            expected = "Started ok" if enabled else "Disabled ok"
+            line = self.command("!START" if enabled else "!DISABLE", lambda value: value == expected)
+            self.enabled = bool(enabled)
+            return {"enabled": self.enabled, "reply": line}
+
+    def clear_faults(self):
+        with self.lock:
+            line = self.command("!CLEARFAULT", lambda value: value == "Faults cleared ok")
+            state = self.read_status()
+            self.last_error = self.fault_message()
+            return {**state, "reply": line}
+
+    @staticmethod
+    def queue_reply(line):
+        return line.isdigit() and 0 <= int(line) <= 16
 
     def move_joints(self, angles, internal=False):
         self._require()
@@ -296,9 +377,11 @@ class RobotLink:
             if not limit["min_deg"] <= value <= limit["max_deg"]:
                 raise ValueError(f"{limit['name']} 超出范围 [{limit['min_deg']}, {limit['max_deg']}]°")
         speed = float(CONFIG["robot"]["joint_speed_deg_s"])
-        command = "&" + ",".join(f"{v:.2f}" for v in angles + [speed])
-        line = self.command(command, lambda s: "ok" in s.lower(), timeout=float(CONFIG["serial"]["operation_timeout_s"]))
-        self.last_joints = angles
+        command = ">" + ",".join(f"{v:.2f}" for v in angles + [speed])
+        with self.lock:
+            if self.command_mode != 2:
+                self.set_mode(2)
+            line = self.command(command, self.queue_reply)
         return {"reply": line, "joints_deg": angles}
 
     def set_gripper(self, angle):
@@ -331,6 +414,9 @@ class RobotLink:
             deadline = time.monotonic() + float(CONFIG["serial"]["operation_timeout_s"])
             tolerance = float(CONFIG["robot"]["joint_tolerance_deg"])
             while time.monotonic() < deadline:
+                self.read_status()
+                if any(self.faults) or not self.enabled:
+                    raise RuntimeError(self.fault_message() or "运动已停止")
                 self.last_joints = self.read_joints()
                 if all(abs(a - b) <= tolerance for a, b in zip(self.last_joints, target)):
                     return {"reply": "pose reached", "joints_deg": self.last_joints}
@@ -341,8 +427,9 @@ class RobotLink:
 
     def stop(self):
         self._require()
-        line = self.command("!STOP", lambda s: "Stopped ok" in s)
-        return {"reply": line}
+        line = self.command("!STOP", lambda s: s == "Stopped ok")
+        self.enabled = False
+        return {"reply": line, "enabled": False}
 
     def send_user_command(self, text):
         """Send one explicitly supported USB-CDC ASCII command from the UI."""
@@ -351,6 +438,21 @@ class RobotLink:
         if not command or len(command) > 128 or not command.isascii() or "\r" in command or "\n" in command:
             raise ValueError("请输入一条不超过 128 字符的 ASCII 指令，不要包含换行")
 
+        if command == "#GETSTATUS":
+            return {"command": command, **self.read_status()}
+        if command == "#GETCAN":
+            return {"command": command, "reply": self.command(
+                command, lambda value: bool(re.fullmatch(r"okc(?: \d+){6}", value)))}
+        if re.fullmatch(r"#GETDRV [1-6]", command):
+            joint = command[-1]
+            return {"command": command, "reply": self.command(
+                command, lambda value: bool(re.fullmatch(r"okd " + joint + r"(?: \d+){6}", value)))}
+        if re.fullmatch(r"#GETTIMING [1-6]", command):
+            joint = command[-1]
+            return {"command": command, "reply": self.command(
+                command, lambda value: bool(re.fullmatch(r"okt " + joint + r"(?: \d+){3}", value)))}
+        if command == "!CLEARFAULT":
+            return {"command": command, **self.clear_faults()}
         if command == "#GETJPOS":
             values = self.read_joints()
             return {"command": command, "reply": "okj " + " ".join(f"{v:.2f}" for v in values)}
@@ -388,25 +490,18 @@ class RobotLink:
             reply = self.command(command, lambda line: "Grip current" in line)
             return {"command": command, "reply": reply}
 
-        match = re.fullmatch(r"#CMDMODE\s+([1-3])", command)
+        match = re.fullmatch(r"#CMDMODE\s+([1-4])", command)
         if match:
             if self.busy:
                 raise RuntimeError("Homing/Resting 正在执行，当前不能切换命令模式")
-            mode = int(match.group(1))
-            # This firmware branch changes the mode but does not send a reply.
-            with self.lock:
-                self.device.reset_input_buffer()
-                self.device.write((command + "\r\n").encode("ascii"))
-                self.device.flush()
-            names = {1: "顺序目标点", 2: "可中断目标点", 3: "电机调试"}
-            return {"command": command, "reply": f"已发送，固件不返回确认；模式请求：{names[mode]}"}
+            return {"command": command, "reply": self.set_mode(int(match.group(1)))}
 
-        if command[0] in ">&@":
+        if command[0] in ">@":
             values_text = command[1:].split(",")
-            expected_counts = {"&": (7, 8, 9), ">": (7,), "@": (7,)}
+            expected_counts = {">": (7, 8, 9), "@": (7,)}
             if len(values_text) not in expected_counts[command[0]]:
-                if command[0] == "&":
-                    raise ValueError("& 指令格式：&J1,J2,J3,J4,J5,J6,速度[,夹爪角[,夹爪电流]]")
+                if command[0] == ">":
+                    raise ValueError("> 指令格式：>J1,J2,J3,J4,J5,J6,速度[,夹爪角[,夹爪电流]]")
                 raise ValueError(f"{command[0]} 指令格式：{command[0]}六个目标值,速度")
             try:
                 values = [float(value) for value in values_text]
@@ -419,20 +514,20 @@ class RobotLink:
             if self.busy:
                 raise RuntimeError("Homing/Resting 正在执行，当前不能发送运动指令")
             joint_limits = CONFIG["robot"]["joints"]
-            if command[0] in "&>":
+            if command[0] == ">":
                 for index, (angle, limit) in enumerate(zip(values[:6], joint_limits), 1):
                     if not limit["min_deg"] <= angle <= limit["max_deg"]:
                         raise ValueError(f"J{index}={angle:g}° 超出范围 [{limit['min_deg']}, {limit['max_deg']}]°")
             speed = float(CONFIG["robot"]["joint_speed_deg_s"])
             if abs(values[6] - speed) > 1e-6:
                 raise ValueError(f"运动速度必须为配置值 {speed:g}°/s")
-            if command[0] == "&" and len(values) >= 8:
+            if command[0] == ">" and len(values) >= 8:
                 gripper = CONFIG["robot"]["gripper"]
                 if not gripper["min_deg"] <= values[7] <= gripper["max_deg"]:
                     raise ValueError(f"夹爪角需在 [{gripper['min_deg']}, {gripper['max_deg']}]°")
-            if command[0] == "&" and len(values) == 9 and not 0.0 <= values[8] <= 1.0:
+            if command[0] == ">" and len(values) == 9 and not 0.0 <= values[8] <= 1.0:
                 raise ValueError("夹爪电流参数范围为 0 到 1")
-            reply = self.command(command, lambda line: line == "ok" or line.isdigit())
+            reply = self.command(command, self.queue_reply)
             note = "固件已接收指令；串口回包不代表机械臂已到位"
             if reply.isdigit():
                 note = f"指令已进入运动队列（剩余空间 {reply}）；请看实际遥测确认到位"
@@ -609,6 +704,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = ROBOT.connect(data)
             elif parsed.path == "/api/serial/disconnect":
                 result = ROBOT.disconnect()
+            elif parsed.path == "/api/robot/clear_faults":
+                result = ROBOT.clear_faults()
             elif parsed.path == "/api/robot/enable":
                 result = ROBOT.set_enabled(bool(data.get("enabled")))
             elif parsed.path == "/api/robot/joints":

@@ -172,9 +172,11 @@ void MotionPlanner::PositionTracker::Init()
 
 void MotionPlanner::PositionTracker::SetVelocityAcc(int32_t value)
 {
+    if (value <= 0) return;
     velocityUpAcc = value;
     velocityDownAcc = value;
     quickVelocityDownAcc = 0.5f / (float) velocityDownAcc;
+    speedLockingBrake = value / 1000;
 }
 
 

@@ -183,6 +183,9 @@ static int8_t CDC_Init_FS(void)
     USBD_CDC_SetRxBuffer(&hUsbDeviceFS, CDCRxBufferFS, CDC_OUT_EP);
     USBD_CDC_SetTxBuffer(&hUsbDeviceFS, REFTxBufferFS, 0, ODRIVE_OUT_EP);
     USBD_CDC_SetRxBuffer(&hUsbDeviceFS, REFRxBufferFS, ODRIVE_OUT_EP);
+    // Re-enumeration discards pending IN transfers, so no completion callback
+    // will return their token. Both endpoints are idle at class initialization.
+    if (sem_usb_tx != NULL) osSemaphoreRelease(sem_usb_tx);
     return (USBD_OK);
     /* USER CODE END 3 */
 }
@@ -321,6 +324,8 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len, uint8_t endpoint_pair)
         return USBD_FAIL;
 
     USBD_CDC_HandleTypeDef* hcdc = (USBD_CDC_HandleTypeDef*) hUsbDeviceFS.pClassData;
+    if (hcdc == NULL)
+        return USBD_FAIL;
 
     // Select EP
     USBD_CDC_EP_HandleTypeDef* hEP_Tx;

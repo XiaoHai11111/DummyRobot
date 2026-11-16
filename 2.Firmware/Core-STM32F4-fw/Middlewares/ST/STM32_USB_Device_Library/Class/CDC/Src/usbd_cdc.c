@@ -60,6 +60,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "usbd_cdc.h"
+#include "interface_usb.hpp"
 #include "usbd_desc.h"
 #include "usbd_ctlreq.h"
 #include <cmsis_os.h>
@@ -572,7 +573,10 @@ static uint8_t  USBD_CDC_DataIn (USBD_HandleTypeDef *pdev, uint8_t epnum)
     {
         // NOTE: We would logically expect xx_IN_EP here, but we actually get the xx_OUT_EP
         if (epnum == CDC_OUT_EP)
+        {
             hcdc->CDC_Tx.State = 0;
+            ++usb_stats_.cdc_tx_complete;
+        }
         if (epnum == ODRIVE_OUT_EP)
             hcdc->REF_Tx.State = 0;
         //Note: We could use independent semaphores for simoultainous USB transmission.

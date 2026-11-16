@@ -27,11 +27,19 @@ public:
     bool inverseDirection;
     uint8_t reduction;
     State state = STOP;
+    volatile uint32_t lastFeedbackTick = 0;
+    volatile uint32_t feedbackCount = 0;
+    volatile uint16_t controlLastCycles = 0, controlMaxCycles = 0;
+    volatile uint32_t controlOverruns = 0, timingReplyCount = 0;
+    volatile bool feedbackReceived = false;
+    volatile bool statusSupported = false;
+    volatile uint8_t driverState = 0;
+    volatile uint8_t faultFlags = 0;
 
     void SetAngle(float _angle);
     void SetAngleWithVelocityLimit(float _angle, float _vel);
     // CAN Command
-    void SetEnable(bool _enable);
+    bool SetEnable(bool _enable);
     void DoCalibration();
     void SetCurrentSetPoint(float _val);
     void SetVelocitySetPoint(float _val);
@@ -53,6 +61,12 @@ public:
 
     void UpdateAngle();
     void UpdateAngleCallback(float _pos, bool _isFinished);
+    void UpdateStatus(uint8_t _state, uint8_t _faults, bool _supported);
+    uint32_t FeedbackAge() const;
+    bool ClearFaults();
+    bool ReadControlTiming();
+    void UpdateControlTiming(uint16_t last, uint16_t peak, uint32_t overruns);
+    void Hold();
 
 
     // Communication protocol definitions
@@ -88,8 +102,14 @@ public:
 
 private:
     CAN_HandleTypeDef* hcan;
-    uint8_t canBuf[8] = {};
-    CAN_TxHeaderTypeDef txHeader = {};
+    const CAN_TxHeaderTypeDef baseHeader = {
+        .StdId = 0,
+        .ExtId = 0,
+        .IDE = CAN_ID_STD,
+        .RTR = CAN_RTR_DATA,
+        .DLC = 8,
+        .TransmitGlobalTime = DISABLE
+    };
 };
 
 #endif //DUMMY_CORE_FW_CTRL_STEP_HPP

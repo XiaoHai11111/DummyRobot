@@ -60,11 +60,11 @@ void HAL::Serial_Update()
         String rev1;
         rev = Serial.readStringUntil('\n');
         
-        // 确保rev不为空，并且以 '&' 开头
-        if (rev.length() > 0 && rev[0] == '&')
+        // 确保rev不为空，并且以 '>' 开头
+        if (rev.length() > 0 && rev[0] == '>')
         {
             // 使用c_str()获取const char*类型的指针
-            argNum = sscanf(rev.c_str(), "&%f,%f,%f,%f,%f,%f", &joints_info.joint1, &joints_info.joint2, &joints_info.joint3,
+            argNum = sscanf(rev.c_str(), ">%f,%f,%f,%f,%f,%f", &joints_info.joint1, &joints_info.joint2, &joints_info.joint3,
                             &joints_info.joint4, &joints_info.joint5, &joints_info.joint6);
             if (argNum == 6)
             {

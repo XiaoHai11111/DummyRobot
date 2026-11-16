@@ -3,6 +3,7 @@
 #include "ascii_processor.hpp"
 #include "fibre/protocol.hpp"
 #include "usart.h"
+#include "stream_lock.hpp"
 
 #define UART_TX_BUFFER_SIZE 64
 #define UART_RX_BUFFER_SIZE 64
@@ -21,6 +22,7 @@ osThreadId_t uartServerTaskHandle;
 class UART4Sender : public StreamSink
 {
 public:
+    void Init() { writeLock.Init(); }
     UART4Sender()
     {
         channelType = CHANNEL_TYPE_UART4;
@@ -28,6 +30,8 @@ public:
 
     int process_bytes(const uint8_t* buffer, size_t length, size_t* processed_bytes) override
     {
+        StreamWriteLock::Guard guard(writeLock);
+        if (!guard) return -1;
         // Loop to ensure all bytes get sent
         while (length)
         {
@@ -40,7 +44,10 @@ public:
             // transmit chunk
             memcpy(tx_buf_, buffer, chunk);
             if (HAL_UART_Transmit_DMA(&huart4, tx_buf_, chunk) != HAL_OK)
+            {
+                osSemaphoreRelease(sem_uart4_dma);
                 return -1;
+            }
             buffer += chunk;
             length -= chunk;
             if (processed_bytes)
@@ -53,12 +60,14 @@ public:
     { return SIZE_MAX; }
 
 private:
+    StreamWriteLock writeLock;
     uint8_t tx_buf_[UART_TX_BUFFER_SIZE];
 } uart4_stream_output;
 
 class UART5Sender : public StreamSink
 {
 public:
+    void Init() { writeLock.Init(); }
     UART5Sender()
     {
         channelType = CHANNEL_TYPE_UART5;
@@ -66,6 +75,8 @@ public:
 
     int process_bytes(const uint8_t* buffer, size_t length, size_t* processed_bytes) override
     {
+        StreamWriteLock::Guard guard(writeLock);
+        if (!guard) return -1;
         // Loop to ensure all bytes get sent
         while (length)
         {
@@ -78,7 +89,10 @@ public:
             // transmit chunk
             memcpy(tx_buf_, buffer, chunk);
             if (HAL_UART_Transmit_DMA(&huart5, tx_buf_, chunk) != HAL_OK)
+            {
+                osSemaphoreRelease(sem_uart5_dma);
                 return -1;
+            }
             buffer += chunk;
             length -= chunk;
             if (processed_bytes)
@@ -91,6 +105,7 @@ public:
     { return SIZE_MAX; }
 
 private:
+    StreamWriteLock writeLock;
     uint8_t tx_buf_[UART_TX_BUFFER_SIZE];
 } uart5_stream_output;
 
@@ -176,14 +191,23 @@ static void UartServerTask(void* ctx)
     };
 }
 
+// Static SRAM allocation keeps the larger ASCII/RPC stacks out of the 64 KiB RTOS heap.
+alignas(8) static StackType_t uartServerStack[1024];
+static StaticTask_t uartServerTaskControl;
+
 const osThreadAttr_t uartServerTask_attributes = {
     .name = "UartServerTask",
-    .stack_size = 2000,
+    .cb_mem = &uartServerTaskControl,
+    .cb_size = sizeof(uartServerTaskControl),
+    .stack_mem = uartServerStack,
+    .stack_size = sizeof(uartServerStack),
     .priority = (osPriority_t) osPriorityNormal,
 };
 
 void StartUartServer()
 {
+    uart4_stream_output.Init();
+    uart5_stream_output.Init();
     // DMA is set up to receive in a circular buffer forever.
     // We don't use interrupts to fetch the data, instead we periodically read
     // data out of the circular buffer into a parse buffer, controlled by a state machine
@@ -195,6 +219,7 @@ void StartUartServer()
 
     // Start UART communication thread
     uartServerTaskHandle = osThreadNew(UartServerTask, nullptr, &uartServerTask_attributes);
+    configASSERT(uartServerTaskHandle != nullptr);
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef* huart)

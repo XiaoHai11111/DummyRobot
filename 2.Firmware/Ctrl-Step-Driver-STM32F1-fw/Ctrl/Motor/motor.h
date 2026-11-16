@@ -66,7 +66,8 @@ public:
         STATE_RUNNING,
         STATE_OVERLOAD,
         STATE_STALL,
-        STATE_NO_CALIB
+        STATE_NO_CALIB,
+        STATE_CONTROL_OVERRUN
     } State_t;
 
 
@@ -135,6 +136,11 @@ public:
         void SetBrake(bool _brake);
         void ApplyPosAsHomeOffset();
         void ClearStallFlag();
+        // Requests are consumed by the 20 kHz loop, never reset a live planner in a CAN ISR.
+        void RequestHold();
+        void ReportControlOverrun();
+        void SetEnable(bool enable);
+        uint8_t GetFaultFlags() const;
 
 
     private:
@@ -164,6 +170,11 @@ public:
         uint32_t stalledTime{};
         uint32_t overloadTime{};
         bool overloadFlag{};
+        bool controlOverrunFlag{};
+        volatile bool clearFaultsRequested{};
+        volatile bool holdRequested{};
+        bool holding{};
+        bool motionBlocked{};
 
 
         void AttachConfig(Config_t* _config);

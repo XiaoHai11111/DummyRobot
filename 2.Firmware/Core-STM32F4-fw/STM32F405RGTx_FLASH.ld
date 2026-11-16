@@ -188,10 +188,16 @@ SECTIONS
     . = ALIGN(8);
     PROVIDE ( end = . );
     PROVIDE ( _end = . );
+    __HeapBase = .;
     . = . + _Min_Heap_Size;
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
+
+  /* Reserve the main/interrupt stack at the top of SRAM. RTOS task stacks
+     may reside in CCM or .bss, so their SP is not a libc heap boundary. */
+  __HeapLimit = ORIGIN(RAM) + LENGTH(RAM) - _Min_Stack_Size;
+  ASSERT(__HeapBase + _Min_Heap_Size <= __HeapLimit, "SRAM heap overlaps MSP reserve")
 
   
 

@@ -1,14 +1,15 @@
 #include "communication.hpp"
 #include "dummy_robot.h"
+#include "motion_command.h"
 
 inline float AbsMaxOf6(DOF6Kinematic::Joint6D_t _joints, uint8_t &_index)
 {
     float max = -1;
     for (uint8_t i = 0; i < 6; i++)
     {
-        if (abs(_joints.a[i]) > max)
+        if (fabsf(_joints.a[i]) > max)
         {
-            max = abs(_joints.a[i]);
+            max = fabsf(_joints.a[i]);
             _index = i;
         }
     }
@@ -45,6 +46,7 @@ DummyRobot::~DummyRobot()
 
 void DummyRobot::Init()
 {
+    safetyStarted = HAL_GetTick();
     SetCommandMode(DEFAULT_COMMAND_MODE);
     SetJointSpeed(DEFAULT_JOINT_SPEED);
 }
@@ -57,27 +59,35 @@ void DummyRobot::Reboot()
     HAL_NVIC_SystemReset();
 }
 
-float i = 1.0;//测试
 void DummyRobot::MoveJoints(DOF6Kinematic::Joint6D_t _joints)
 {
-    i = i+1;//测试
+    if (!IsEnabled() || HasFault()) return;
+    const uint32_t generation = commandHandler.GetGeneration();
     for (int j = 1; j <= 6; j++)
     {
+        if (!IsEnabled() || HasFault() || recovering || generation != commandHandler.GetGeneration()) return;
         motorJ[j]->SetAngleWithVelocityLimit(_joints.a[j - 1] - initPose.a[j - 1],
                                              dynamicJointSpeeds.a[j - 1]);
-        //motorJ[j]->SetPositionWithVelocityLimit(i,1);//自己测试
     }
 }
 
 
 bool DummyRobot::MoveJ(float _j1, float _j2, float _j3, float _j4, float _j5, float _j6)
 {
+    return MoveJAtGeneration(_j1, _j2, _j3, _j4, _j5, _j6, commandHandler.GetGeneration());
+}
+
+bool DummyRobot::MoveJAtGeneration(float _j1, float _j2, float _j3, float _j4, float _j5, float _j6,
+                                   uint32_t generation)
+{
+    if (!IsEnabled() || HasFault() || recovering) return false;
     DOF6Kinematic::Joint6D_t targetJointsTmp(_j1, _j2, _j3, _j4, _j5, _j6);
     bool valid = true;
 
     for (int j = 1; j <= 6; j++)
     {
-        if (targetJointsTmp.a[j - 1] > motorJ[j]->angleLimitMax ||
+        if (!MotionFinite(targetJointsTmp.a[j - 1]) ||
+            targetJointsTmp.a[j - 1] > motorJ[j]->angleLimitMax ||
             targetJointsTmp.a[j - 1] < motorJ[j]->angleLimitMin)
             valid = false;
     }
@@ -87,15 +97,24 @@ bool DummyRobot::MoveJ(float _j1, float _j2, float _j3, float _j4, float _j5, fl
         DOF6Kinematic::Joint6D_t deltaJoints = targetJointsTmp - currentJoints;
         uint8_t index;
         float maxAngle = AbsMaxOf6(deltaJoints, index);
-        float time = maxAngle * (float) (motorJ[index + 1]->reduction) / jointSpeed;
+        DOF6Kinematic::Joint6D_t speeds{};
+        // Joint speed is deg/s; CAN velocity is motor rev/s. Avoid 0/0 at rest.
+        const float time = maxAngle / jointSpeed;
         for (int j = 1; j <= 6; j++)
-        {
-            dynamicJointSpeeds.a[j - 1] =
-                abs(deltaJoints.a[j - 1] * (float) (motorJ[j]->reduction) / time * 0.1f); //0~10r/s
-        }
+            speeds.a[j - 1] = maxAngle > 0.0001f ?
+                fmaxf(0.01f, fabsf(deltaJoints.a[j - 1] * motorJ[j]->reduction / (360.0f * time))) : 0.01f;
 
+        taskENTER_CRITICAL();
+        if (!isEnabled || HasFault() || recovering || generation != commandHandler.GetGeneration())
+        {
+            taskEXIT_CRITICAL();
+            return false;
+        }
+        dynamicJointSpeeds = speeds;
+        motionTimeoutMs = static_cast<uint32_t>(fminf(600000.0f, fmaxf(30000.0f, time * 2000 + 5000)));
         jointsStateFlag = 0;
         targetJoints = targetJointsTmp;
+        taskEXIT_CRITICAL();
 
         return true;
     }
@@ -106,6 +125,15 @@ bool DummyRobot::MoveJ(float _j1, float _j2, float _j3, float _j4, float _j5, fl
 
 bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _c)
 {
+    return MoveLAtGeneration(_x, _y, _z, _a, _b, _c, commandHandler.GetGeneration());
+}
+
+bool DummyRobot::MoveLAtGeneration(float _x, float _y, float _z, float _a, float _b, float _c,
+                                   uint32_t generation)
+{
+    if (!IsEnabled() || HasFault() || !MotionFinite(_x) || !MotionFinite(_y) ||
+        !MotionFinite(_z) || !MotionFinite(_a) || !MotionFinite(_b) || !MotionFinite(_c))
+        return false;
     DOF6Kinematic::Pose6D_t pose6D(_x, _y, _z, _a, _b, _c);
     DOF6Kinematic::IKSolves_t ikSolves{};
     DOF6Kinematic::Joint6D_t lastJoint6D{};
@@ -121,7 +149,8 @@ bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _
 
         for (int j = 1; j <= 6; j++)
         {
-            if (ikSolves.config[i].a[j - 1] > motorJ[j]->angleLimitMax ||
+            if (!MotionFinite(ikSolves.config[i].a[j - 1]) ||
+                ikSolves.config[i].a[j - 1] > motorJ[j]->angleLimitMax ||
                 ikSolves.config[i].a[j - 1] < motorJ[j]->angleLimitMin)
             {
                 valid[i] = false;
@@ -152,9 +181,9 @@ bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _
             }
         }
 
-        return MoveJ(ikSolves.config[indexConfig].a[0], ikSolves.config[indexConfig].a[1],
+        return MoveJAtGeneration(ikSolves.config[indexConfig].a[0], ikSolves.config[indexConfig].a[1],
                      ikSolves.config[indexConfig].a[2], ikSolves.config[indexConfig].a[3],
-                     ikSolves.config[indexConfig].a[4], ikSolves.config[indexConfig].a[5]);
+                     ikSolves.config[indexConfig].a[4], ikSolves.config[indexConfig].a[5], generation);
     }
 
     return false;
@@ -162,7 +191,8 @@ bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _
 
 void DummyRobot::UpdateJointAngles()
 {
-    motorJ[ALL]->UpdateAngle();
+    // Address nodes individually to reduce simultaneous reply contention.
+    for (unsigned j = 1; j <= 6; ++j) motorJ[j]->UpdateAngle();
 }
 
 
@@ -172,7 +202,8 @@ void DummyRobot::UpdateJointAnglesCallback()
     {
         currentJoints.a[i - 1] = motorJ[i]->angle + initPose.a[i - 1];
 
-        if (motorJ[i]->state == CtrlStepMotor::FINISH)
+        if (motorJ[i]->state == CtrlStepMotor::FINISH &&
+            fabsf(currentJoints.a[i - 1] - targetJoints.a[i - 1]) <= 0.5f)
             jointsStateFlag |= (1 << i);
         else
             jointsStateFlag &= ~(1 << i);
@@ -182,7 +213,7 @@ void DummyRobot::UpdateJointAnglesCallback()
 
 void DummyRobot::SetJointSpeed(float _speed)
 {
-    if (_speed < 0)_speed = 0;
+    if (!MotionFinite(_speed) || _speed <= 0) return;
     else if (_speed > 100) _speed = 100;
 
     jointSpeed = _speed * jointSpeedRatio;
@@ -191,7 +222,7 @@ void DummyRobot::SetJointSpeed(float _speed)
 
 void DummyRobot::SetJointAcceleration(float _acc)
 {
-    if (_acc < 0)_acc = 0;
+    if (!MotionFinite(_acc) || _acc <= 0) return;
     else if (_acc > 100) _acc = 100;
 
     for (int i = 1; i <= 6; i++)
@@ -218,7 +249,10 @@ void DummyRobot::  CalibrateHomeOffset()
     // 3.Go to Resting-Pose
     initPose = DOF6Kinematic::Joint6D_t(0, 0, 90, 0, 0, 0);
     currentJoints = DOF6Kinematic::Joint6D_t(0, 0, 90, 0, 0, 0);
+    SetEnable(true);
+    if (!IsEnabled()) return;
     Resting();
+    if (!IsEnabled() || HasFault()) return;
     osDelay(500);
 
     // 4.Apply Home-Offset the second time
@@ -239,8 +273,7 @@ void DummyRobot::Homing()
 
     MoveJ(0, 0, 90, 0, 0, 0);
     MoveJoints(targetJoints);
-    while (IsMoving())
-        osDelay(10);
+    WaitForMotion();
 
     SetJointSpeed(lastSpeed);
 }
@@ -254,8 +287,7 @@ void DummyRobot::Resting()
     MoveJ(REST_POSE.a[0], REST_POSE.a[1], REST_POSE.a[2],
           REST_POSE.a[3], REST_POSE.a[4], REST_POSE.a[5]);
     MoveJoints(targetJoints);
-    while (IsMoving())
-        osDelay(10);
+    WaitForMotion();
 
     SetJointSpeed(lastSpeed);
 }
@@ -263,8 +295,156 @@ void DummyRobot::Resting()
 
 void DummyRobot::SetEnable(bool _enable)
 {
-    motorJ[ALL]->SetEnable(_enable);
-    isEnabled = _enable;
+    if (_enable)
+    {
+        if (recovering) return;
+        CheckSafety();
+        for (int j = 1; j <= 6; ++j)
+            if (!motorJ[j]->feedbackReceived || !motorJ[j]->statusSupported ||
+                motorJ[j]->FeedbackAge() > 250)
+                return;
+        if (HasFault()) return;
+        if (isEnabled) return;
+        commandHandler.ClearFifo();
+        const uint32_t generation = commandHandler.GetGeneration();
+        if (!motorJ[ALL]->SetEnable(true)) return;
+        taskENTER_CRITICAL();
+        if (generation != commandHandler.GetGeneration() || HasFault() || recovering)
+        {
+            taskEXIT_CRITICAL();
+            if (holdOnStop) motorJ[ALL]->Hold();
+            else motorJ[ALL]->SetEnable(false);
+            return;
+        }
+        targetJoints = currentJoints;
+        dynamicJointSpeeds = DOF6Kinematic::Joint6D_t(0.01f, 0.01f, 0.01f, 0.01f, 0.01f, 0.01f);
+        holdOnStop = false;
+        enabledAt = HAL_GetTick();
+        isEnabled = true;
+        taskEXIT_CRITICAL();
+    } else
+    {
+        isEnabled = false;
+        holdOnStop = false;
+        commandHandler.ClearFifo();
+        motorJ[ALL]->SetEnable(false);
+    }
+}
+
+bool DummyRobot::HasFault() const
+{
+    return GetFaultJointMask() != 0;
+}
+
+uint8_t DummyRobot::GetFaultJointMask() const
+{
+    uint8_t mask = 0;
+    for (unsigned j = 1; j <= 6; ++j)
+        if (jointFaults[j]) mask |= 1U << (j - 1);
+    return mask;
+}
+
+void DummyRobot::CheckSafety()
+{
+    if (recovering) return;
+    const uint32_t now = HAL_GetTick();
+    for (unsigned j = 1; j <= 6; ++j)
+    {
+        const auto motor = motorJ[j];
+        if (motor->feedbackReceived)
+        {
+            jointFaults[j] |= motor->faultFlags;
+            if (!motor->statusSupported) jointFaults[j] |= 16;
+            const uint32_t age = motor->FeedbackAge();
+            if (age > 250)
+            {
+                if (!(jointFaults[j] & 8)) faultFeedbackAge[j] = age;
+                jointFaults[j] |= 8;
+            }
+            if (isEnabled && now - enabledAt > 100 && motor->statusSupported && motor->driverState == 0)
+                jointFaults[j] |= 64; // Driver stopped/rebooted despite an enabled F4.
+        } else if (now - safetyStarted > 1000)
+        {
+            if (!(jointFaults[j] & 8)) faultFeedbackAge[j] = UINT32_MAX;
+            jointFaults[j] |= 8;
+        }
+    }
+    if (HasFault() && isEnabled) StopMotion();
+}
+
+void DummyRobot::StopMotion()
+{
+    isEnabled = false;
+    holdOnStop = true;
+    commandHandler.ClearFifo();
+    targetJoints = currentJoints;
+    // Each driver uses its own measured position, not a potentially stale F4 angle.
+    motorJ[ALL]->Hold();
+}
+
+bool DummyRobot::ClearFaults()
+{
+    taskENTER_CRITICAL();
+    if (recovering || isEnabled)
+    {
+        taskEXIT_CRITICAL();
+        return false;
+    }
+    recovering = true;
+    taskEXIT_CRITICAL();
+    SetEnable(false);
+    bool sent = true;
+    for (unsigned j = 1; j <= 6; ++j)
+        sent = motorJ[j]->ClearFaults() && sent;
+    const uint32_t start = HAL_GetTick();
+    bool ready = false;
+    while (sent && HAL_GetTick() - start < 500)
+    {
+        osDelay(10);
+        ready = HAL_GetTick() - start >= 20;
+        for (unsigned j = 1; j <= 6; ++j)
+        {
+            const auto motor = motorJ[j];
+            ready = ready && motor->feedbackReceived && motor->statusSupported &&
+                    static_cast<int32_t>(motor->lastFeedbackTick - start) >= 20 &&
+                    motor->FeedbackAge() <= 250 &&
+                    motor->faultFlags == 0 && motor->driverState == 0;
+        }
+        if (ready) break;
+    }
+    if (ready)
+    {
+        for (unsigned j = 1; j <= 6; ++j)
+        {
+            jointFaults[j] = 0;
+            faultFeedbackAge[j] = 0;
+        }
+        targetJoints = currentJoints;
+    }
+    recovering = false;
+    CheckSafety();
+    return ready && !HasFault();
+}
+
+bool DummyRobot::WaitForMotion(uint32_t timeoutMs)
+{
+    if (!timeoutMs) timeoutMs = motionTimeoutMs;
+    const uint32_t start = HAL_GetTick();
+    const uint32_t generation = commandHandler.GetGeneration();
+    // Give the control task time to transmit the new target and receive its status.
+    osDelay(10);
+    while (IsEnabled() && !HasFault() && IsMoving() && generation == commandHandler.GetGeneration())
+    {
+        if (HAL_GetTick() - start >= timeoutMs)
+        {
+            for (unsigned j = 1; j <= 6; ++j)
+                if (!(jointsStateFlag & (1U << j))) jointFaults[j] |= 32;
+            StopMotion();
+            return false;
+        }
+        osDelay(5);
+    }
+    return IsEnabled() && !HasFault() && !IsMoving() && generation == commandHandler.GetGeneration();
 }
 
 
@@ -295,6 +475,7 @@ void DummyRobot::SetCommandMode(uint32_t _mode)
         _mode > COMMAND_MOTOR_TUNING)
         return;
 
+    commandHandler.ClearFifo();
     commandMode = static_cast<CommandMode>(_mode);
 
     switch (commandMode)
@@ -318,15 +499,7 @@ DummyHand::DummyHand(CAN_HandleTypeDef* _hcan, uint8_t
 _id) :
     nodeID(_id), hcan(_hcan)
 {
-    txHeader =
-        {
-            .StdId = 0,
-            .ExtId = 0,
-            .IDE = CAN_ID_STD,
-            .RTR = CAN_RTR_DATA,
-            .DLC = 8,
-            .TransmitGlobalTime = DISABLE
-        };
+
 }
 
 
@@ -335,6 +508,8 @@ void DummyHand::SetAngle(float _angle)
     if (_angle > 45)_angle = 45;
     if (_angle < 0)_angle = 0;
 
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x02;
     txHeader.StdId = 7 << 7 | mode;
 
@@ -352,6 +527,8 @@ void DummyHand::SetMaxCurrent(float _val)
     if (_val > 1)_val = 1;
     if (_val < 0)_val = 0;
 
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x01;
     txHeader.StdId = 7 << 7 | mode;
 
@@ -373,149 +550,90 @@ void DummyHand::SetEnable(bool _enable)
 }
 
 
-uint32_t DummyRobot::CommandHandler::Push(const std::string &_cmd)
+uint32_t DummyRobot::CommandHandler::Push(const std::string &_cmd, StreamSink* response)
 {
-    osStatus_t status = osMessageQueuePut(commandFifo, _cmd.c_str(), 0U, 0U);
-    if (status == osOK)
-        return osMessageQueueGetSpace(commandFifo);
-
-    return 0xFF; // failed
+    Entry entry;
+    MotionCommand parsed;
+    if (_cmd.empty() || _cmd.size() >= sizeof(entry.text) || !parsed.Parse(_cmd.c_str()) ||
+        context->commandMode == COMMAND_MOTOR_TUNING)
+        return 0xFF;
+    if (parsed.kind == '>')
+        for (unsigned j = 1; j <= 6; ++j)
+            if (parsed.values[j - 1] < context->motorJ[j]->angleLimitMin ||
+                parsed.values[j - 1] > context->motorJ[j]->angleLimitMax)
+                return 0xFF;
+    memcpy(entry.text, _cmd.c_str(), _cmd.size());
+    entry.response = response;
+    taskENTER_CRITICAL();
+    if (!context->IsEnabled() || context->HasFault() || context->recovering)
+    {
+        taskEXIT_CRITICAL();
+        return 0xFF;
+    }
+    if (context->commandMode == COMMAND_TARGET_POINT_INTERRUPTABLE)
+        ClearFifo(); // INT: only the newest pending target is useful.
+    entry.generation = generation;
+    const osStatus_t status = osMessageQueuePut(commandFifo, &entry, 0U, 0U);
+    taskEXIT_CRITICAL();
+    return status == osOK ? osMessageQueueGetSpace(commandFifo) : 0xFF;
 }
-
 
 void DummyRobot::CommandHandler::EmergencyStop()
 {
-    context->MoveJ(context->currentJoints.a[0], context->currentJoints.a[1], context->currentJoints.a[2],
-                   context->currentJoints.a[3], context->currentJoints.a[4], context->currentJoints.a[5]);
-    context->MoveJoints(context->targetJoints);
-    context->isEnabled = false;
-    ClearFifo();
+    context->StopMotion();
 }
 
-
-std::string DummyRobot::CommandHandler::Pop(uint32_t timeout)
+DummyRobot::CommandHandler::Entry DummyRobot::CommandHandler::Pop(uint32_t timeout)
 {
-    osStatus_t status = osMessageQueueGet(commandFifo, strBuffer, nullptr, timeout);
-
-    return std::string{strBuffer};
+    Entry entry;
+    if (osMessageQueueGet(commandFifo, &entry, nullptr, timeout) != osOK)
+        entry.text[0] = 0;
+    return entry;
 }
-
 
 uint32_t DummyRobot::CommandHandler::GetSpace()
 {
     return osMessageQueueGetSpace(commandFifo);
 }
 
-
-uint32_t DummyRobot::CommandHandler::ParseCommand(const std::string &_cmd)
+uint32_t DummyRobot::CommandHandler::ParseCommand(const Entry &entry)
 {
-    uint8_t argNum;
-
-    switch (context->commandMode)
+    if (!entry.text[0]) return GetSpace();
+    MotionCommand parsed;
+    bool accepted = false;
+    taskENTER_CRITICAL();
+    const bool active = entry.generation == generation && context->IsEnabled() && !context->HasFault();
+    taskEXIT_CRITICAL();
+    if (active && parsed.Parse(entry.text))
     {
-        case COMMAND_TARGET_POINT_SEQUENTIAL:
-        case COMMAND_CONTINUES_TRAJECTORY:
-            if (_cmd[0] == '>')
-            {
-                float joints[6];
-                float speed;
-
-                argNum = sscanf(_cmd.c_str(), ">%f,%f,%f,%f,%f,%f,%f", joints, joints + 1, joints + 2,
-                                joints + 3, joints + 4, joints + 5, &speed);
-                if (argNum == 6)
-                {
-                    context->MoveJ(joints[0], joints[1], joints[2],
-                                   joints[3], joints[4], joints[5]);
-                } else if (argNum == 7)
-                {
-                    context->SetJointSpeed(speed);
-                    context->MoveJ(joints[0], joints[1], joints[2],
-                                   joints[3], joints[4], joints[5]);
-                }
-                // Trigger a transmission immediately, in case IsMoving() returns false
-                context->MoveJoints(context->targetJoints);
-
-                while (context->IsMoving() && context->IsEnabled())
-                    osDelay(5);
-                Respond(*usbStreamOutputPtr, "ok");
-                Respond(*uart4StreamOutputPtr, "ok");
-            } else if (_cmd[0] == '@')
-            {
-                float pose[6];
-                float speed;
-
-                argNum = sscanf(_cmd.c_str(), "@%f,%f,%f,%f,%f,%f,%f", pose, pose + 1, pose + 2,
-                                pose + 3, pose + 4, pose + 5, &speed);
-                if (argNum == 6)
-                {
-                    context->MoveL(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
-                } else if (argNum == 7)
-                {
-                    context->SetJointSpeed(speed);
-                    context->MoveL(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
-                }
-                // Trigger a transmission immediately, in case IsMoving() returns false
-                context->MoveJoints(context->targetJoints);
-
-                while (context->IsMoving())
-                    osDelay(5);
-                Respond(*usbStreamOutputPtr, "ok");
-                Respond(*uart4StreamOutputPtr, "ok");
-            }
-
-            break;
-
-        case COMMAND_TARGET_POINT_INTERRUPTABLE:
-            if (_cmd[0] == '>')
-            {
-                float joints[6];
-                float speed;
-
-                argNum = sscanf(_cmd.c_str(), ">%f,%f,%f,%f,%f,%f,%f", joints, joints + 1, joints + 2,
-                                joints + 3, joints + 4, joints + 5, &speed);
-                if (argNum == 6)
-                {
-                    context->MoveJ(joints[0], joints[1], joints[2],
-                                   joints[3], joints[4], joints[5]);
-                } else if (argNum == 7)
-                {
-                    context->SetJointSpeed(speed);
-                    context->MoveJ(joints[0], joints[1], joints[2],
-                                   joints[3], joints[4], joints[5]);
-                }
-                Respond(*usbStreamOutputPtr, "ok");
-                Respond(*uart4StreamOutputPtr, "ok");
-            } else if (_cmd[0] == '@')
-            {
-                float pose[6];
-                float speed;
-
-                argNum = sscanf(_cmd.c_str(), "@%f,%f,%f,%f,%f,%f,%f", pose, pose + 1, pose + 2,
-                                pose + 3, pose + 4, pose + 5, &speed);
-                if (argNum == 6)
-                {
-                    context->MoveL(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
-                } else if (argNum == 7)
-                {
-                    context->SetJointSpeed(speed);
-                    context->MoveL(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
-                }
-                Respond(*usbStreamOutputPtr, "ok");
-                Respond(*uart4StreamOutputPtr, "ok");
-            }
-            break;
-
-        case COMMAND_MOTOR_TUNING:
-            break;
+        if (parsed.count >= 7) context->SetJointSpeed(parsed.values[6]);
+        // Commit only while this entry is still current; IK can take time.
+        if (entry.generation == generation)
+        {
+            const float* v = parsed.values;
+            accepted = parsed.kind == '>' ? context->MoveJAtGeneration(v[0], v[1], v[2], v[3], v[4], v[5], entry.generation) :
+                                           context->MoveLAtGeneration(v[0], v[1], v[2], v[3], v[4], v[5], entry.generation);
+        }
+        if (accepted && context->IsEnabled() && entry.generation == generation)
+        {
+            if (parsed.count == 9) context->hand->SetMaxCurrent(parsed.values[8]);
+            if (parsed.count >= 8) context->hand->SetAngle(parsed.values[7]);
+            if (context->commandMode == COMMAND_TARGET_POINT_SEQUENTIAL ||
+                context->commandMode == COMMAND_CONTINUES_TRAJECTORY)
+                accepted = context->WaitForMotion();
+        }
     }
-
-    return osMessageQueueGetSpace(commandFifo);
+    if (entry.response)
+        Respond(*entry.response, accepted ? "ok" : "error motion rejected or interrupted");
+    return GetSpace();
 }
-
 
 void DummyRobot::CommandHandler::ClearFifo()
 {
+    taskENTER_CRITICAL();
+    ++generation;
     osMessageQueueReset(commandFifo);
+    taskEXIT_CRITICAL();
 }
 
 

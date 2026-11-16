@@ -7,22 +7,16 @@ CtrlStepMotor::CtrlStepMotor(CAN_HandleTypeDef* _hcan, uint8_t _id, bool _invers
     nodeID(_id), hcan(_hcan), inverseDirection(_inverse), reduction(_reduction),
     angleLimitMin(_angleLimitMin), angleLimitMax(_angleLimitMax)
 {
-    txHeader =
-        {
-            .StdId = 0,
-            .ExtId = 0,
-            .IDE = CAN_ID_STD,
-            .RTR = CAN_RTR_DATA,
-            .DLC = 8,
-            .TransmitGlobalTime = DISABLE
-        };
+
 }
 
 
-void CtrlStepMotor::SetEnable(bool _enable)
+bool CtrlStepMotor::SetEnable(bool _enable)
 {
     state = _enable ? FINISH : STOP;
 
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x01;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -32,12 +26,14 @@ void CtrlStepMotor::SetEnable(bool _enable)
     for (int i = 0; i < 4; i++)
         canBuf[i] = *(b + i);
 
-    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+    return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
 
 void CtrlStepMotor::DoCalibration()
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x02;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -49,6 +45,8 @@ void CtrlStepMotor::SetCurrentSetPoint(float _val)
 {
     state = RUNNING;
 
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x03;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -65,6 +63,8 @@ void CtrlStepMotor::SetVelocitySetPoint(float _val)
 {
     state = RUNNING;
 
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x04;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -79,6 +79,8 @@ void CtrlStepMotor::SetVelocitySetPoint(float _val)
 
 void CtrlStepMotor::SetPositionSetPoint(float _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x05;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -94,6 +96,8 @@ void CtrlStepMotor::SetPositionSetPoint(float _val)
 
 void CtrlStepMotor::SetPositionWithVelocityLimit(float _pos, float _vel)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x07;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -111,6 +115,8 @@ void CtrlStepMotor::SetPositionWithVelocityLimit(float _pos, float _vel)
 
 void CtrlStepMotor::SetNodeID(uint32_t _id)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x11;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -126,6 +132,8 @@ void CtrlStepMotor::SetNodeID(uint32_t _id)
 
 void CtrlStepMotor::SetCurrentLimit(float _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x12;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -141,6 +149,8 @@ void CtrlStepMotor::SetCurrentLimit(float _val)
 
 void CtrlStepMotor::SetVelocityLimit(float _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x13;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -156,6 +166,8 @@ void CtrlStepMotor::SetVelocityLimit(float _val)
 
 void CtrlStepMotor::SetAcceleration(float _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x14;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -171,6 +183,8 @@ void CtrlStepMotor::SetAcceleration(float _val)
 
 void CtrlStepMotor::ApplyPositionAsHome()
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x15;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -180,6 +194,8 @@ void CtrlStepMotor::ApplyPositionAsHome()
 
 void CtrlStepMotor::SetEnableOnBoot(bool _enable)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x16;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -196,6 +212,8 @@ void CtrlStepMotor::SetEnableOnBoot(bool _enable)
 
 void CtrlStepMotor::SetEnableStallProtect(bool _enable)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x1B;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -211,6 +229,8 @@ void CtrlStepMotor::SetEnableStallProtect(bool _enable)
 
 void CtrlStepMotor::Reboot()
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x7f;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -220,6 +240,8 @@ void CtrlStepMotor::Reboot()
 
 void CtrlStepMotor::EraseConfigs()
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x7e;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -245,6 +267,8 @@ void CtrlStepMotor::SetAngleWithVelocityLimit(float _angle, float _vel)
 
 void CtrlStepMotor::UpdateAngle()
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x23;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -260,9 +284,67 @@ void CtrlStepMotor::UpdateAngleCallback(float _pos, bool _isFinished)
     angle = inverseDirection ? -tmp : tmp;
 }
 
+uint32_t CtrlStepMotor::FeedbackAge() const
+{
+    // Read the ISR-owned timestamp BEFORE the clock. A CAN interrupt between
+    // reading 'now' and the timestamp can otherwise turn a fresh reply into
+    // an unsigned age near UINT32_MAX, latching a false timeout.
+    const uint32_t receivedAt = lastFeedbackTick;
+    return HAL_GetTick() - receivedAt;
+}
+
+void CtrlStepMotor::UpdateStatus(uint8_t _state, uint8_t _faults, bool _supported)
+{
+    driverState = _state;
+    faultFlags = _faults;
+    statusSupported = _supported;
+    lastFeedbackTick = HAL_GetTick();
+    ++feedbackCount;
+    feedbackReceived = true;
+}
+
+bool CtrlStepMotor::ClearFaults()
+{
+    CAN_TxHeaderTypeDef header = baseHeader;
+    header.StdId = nodeID << 7 | 0x08;
+    uint8_t data[8] = {};
+    return CanSendMessage(get_can_ctx(hcan), data, &header);
+}
+
+bool CtrlStepMotor::ReadControlTiming()
+{
+    const uint32_t previous = timingReplyCount;
+    CAN_TxHeaderTypeDef header = baseHeader;
+    header.StdId = nodeID << 7 | 0x25;
+    uint8_t data[8] = {};
+    if (!CanSendMessage(get_can_ctx(hcan), data, &header)) return false;
+    const uint32_t started = HAL_GetTick();
+    while (timingReplyCount == previous && HAL_GetTick() - started < 50) osDelay(1);
+    return timingReplyCount != previous;
+}
+
+void CtrlStepMotor::UpdateControlTiming(uint16_t last, uint16_t peak, uint32_t overruns)
+{
+    controlLastCycles = last;
+    controlMaxCycles = peak;
+    controlOverruns = overruns;
+    ++timingReplyCount;
+    // Timing is diagnostic only; it must not mask a missing position/status reply.
+}
+
+void CtrlStepMotor::Hold()
+{
+    CAN_TxHeaderTypeDef header = baseHeader;
+    header.StdId = nodeID << 7 | 0x09;
+    uint8_t data[8] = {};
+    CanSendMessage(get_can_ctx(hcan), data, &header);
+}
+
 
 void CtrlStepMotor::SetDceKp(int32_t _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x17;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -277,6 +359,8 @@ void CtrlStepMotor::SetDceKp(int32_t _val)
 
 void CtrlStepMotor::SetDceKv(int32_t _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x18;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -291,6 +375,8 @@ void CtrlStepMotor::SetDceKv(int32_t _val)
 
 void CtrlStepMotor::SetDceKi(int32_t _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x19;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -305,6 +391,8 @@ void CtrlStepMotor::SetDceKi(int32_t _val)
 
 void CtrlStepMotor::SetDceKd(int32_t _val)
 {
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
     uint8_t mode = 0x1A;
     txHeader.StdId = nodeID << 7 | mode;
 

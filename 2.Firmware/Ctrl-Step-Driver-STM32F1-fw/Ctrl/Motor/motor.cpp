@@ -1,5 +1,6 @@
 #include "configurations.h"
 #include "motor.h"
+#include "control_math.h"
 
 #include <cmath>
 
@@ -92,6 +93,29 @@ void Motor::CloseLoopControlTick()
     // Estimate Error
     controller->estError = controller->softPosition - controller->estPosition;
 
+    if (controller->clearFaultsRequested || controller->holdRequested)
+    {
+        const bool clear = controller->clearFaultsRequested;
+        controller->clearFaultsRequested = false;
+        controller->holdRequested = false;
+        controller->goalPosition = controller->realPosition;
+        controller->softPosition = controller->realPosition;
+        controller->goalVelocity = controller->softVelocity = 0;
+        controller->goalCurrent = controller->softCurrent = 0;
+        controller->ClearIntegral();
+        motionPlanner.positionTracker.NewTask(controller->realPosition, 0);
+        controller->requestMode = clear ? MODE_STOP : MODE_COMMAND_POSITION;
+        controller->modeRunning = controller->requestMode;
+        controller->softNewCurve = false;
+        controller->holding = !clear;
+        if (clear)
+        {
+            controller->stalledTime = controller->overloadTime = 0;
+            controller->isStalled = controller->overloadFlag = false;
+            controller->controlOverrunFlag = false;
+        }
+    }
+
     /************************************ Ctrl Loop ************************************/
     if (controller->isStalled ||
         controller->softDisable ||
@@ -115,6 +139,8 @@ void Motor::CloseLoopControlTick()
                 controller->CalcDceToOutput(controller->softPosition, controller->softVelocity);
                 break;
             case MODE_STOP:
+                controller->focCurrent = 0;
+                controller->ClearIntegral();
                 driver->Sleep();
                 break;
             case MODE_COMMAND_Trajectory:
@@ -171,7 +197,6 @@ void Motor::CloseLoopControlTick()
     {
         controller->softNewCurve = false;
         controller->ClearIntegral();
-        controller->ClearStallFlag();
 
         switch (controller->modeRunning)
         {
@@ -259,23 +284,22 @@ void Motor::CloseLoopControlTick()
     /******************************** State Check ********************************/
     int32_t current = abs(controller->focCurrent);
 
-    // Stall detect
+    // Require consecutive saturation AND low speed. Recovery of either resets the timer.
     if (controller->config->stallProtectSwitch)
     {
-        if (// Current Mode
+        if ((// Current Mode
             ((controller->modeRunning == MODE_COMMAND_CURRENT ||
               controller->modeRunning == MODE_PWM_CURRENT) &&
              (current != 0))
             || // Other Mode
-            current == config.motionParams.ratedCurrent)
+            current >= config.motionParams.ratedCurrent) &&
+            config.motionParams.ratedCurrent > 0 &&
+            abs(controller->estVelocity) < MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 5)
         {
-            if (abs(controller->estVelocity) < MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 5)
-            {
                 if (controller->stalledTime >= 1000 * 1000)
                     controller->isStalled = true;
                 else
                     controller->stalledTime += motionPlanner.CONTROL_PERIOD;
-            }
         } else // can ONLY clear stall flag  MANUALLY
         {
             controller->stalledTime = 0;
@@ -285,33 +309,41 @@ void Motor::CloseLoopControlTick()
     // Overload detect
     if ((controller->modeRunning != MODE_COMMAND_CURRENT) &&
         (controller->modeRunning != MODE_PWM_CURRENT) &&
-        (current == config.motionParams.ratedCurrent))
+        controller->modeRunning != MODE_STOP &&
+        config.motionParams.ratedCurrent > 0 &&
+        (current >= config.motionParams.ratedCurrent))
     {
         if (controller->overloadTime >= 1000 * 1000)
+        {
+            if (!controller->overloadFlag) controller->RequestHold();
             controller->overloadFlag = true;
+        }
         else
             controller->overloadTime += motionPlanner.CONTROL_PERIOD;
-    } else // auto clear overload flag when released
+    } else // Keep the event latched until an explicit clear, including after STOP.
     {
         controller->overloadTime = 0;
-        controller->overloadFlag = false;
     }
 
     /******************************** Update State ********************************/
     if (!encoder->IsCalibrated())
         controller->state = STATE_NO_CALIB;
-    else if (controller->modeRunning == MODE_STOP)
-        controller->state = STATE_STOP;
+    else if (controller->controlOverrunFlag)
+        controller->state = STATE_CONTROL_OVERRUN;
     else if (controller->isStalled)
         controller->state = STATE_STALL;
     else if (controller->overloadFlag)
         controller->state = STATE_OVERLOAD;
+    else if (controller->modeRunning == MODE_STOP)
+        controller->state = STATE_STOP;
     else
     {
         if (controller->modeRunning == MODE_COMMAND_POSITION)
         {
             if ((controller->softPosition == controller->goalPosition)
-                && (controller->softVelocity == 0))
+                && (controller->softVelocity == 0)
+                && abs(controller->goalPosition - controller->realPosition) <= SOFT_DIVIDE_NUM
+                && abs(controller->estVelocity) <= MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 100)
                 controller->state = STATE_FINISH;
             else
                 controller->state = STATE_RUNNING;
@@ -357,17 +389,11 @@ void Motor::Controller::CalcPidToOutput(int32_t _speed)
     if (config->pid.vError < (-1024 * 1024)) config->pid.vError = (-1024 * 1024);
     config->pid.outputKp = ((config->pid.kp) * (config->pid.vError));
 
-    config->pid.integralRound += (config->pid.ki * config->pid.vError);
-    config->pid.integralRemainder = config->pid.integralRound >> 10;
-    config->pid.integralRound -= (config->pid.integralRemainder << 10);
-    config->pid.outputKi += config->pid.integralRemainder;
-    // integralRound limitation is  ratedCurrent*1024
-    if (config->pid.outputKi > context->config.motionParams.ratedCurrent << 10)
-        config->pid.outputKi = context->config.motionParams.ratedCurrent << 10;
-    else if (config->pid.outputKi < -(context->config.motionParams.ratedCurrent << 10))
-        config->pid.outputKi = -(context->config.motionParams.ratedCurrent << 10);
-
     config->pid.outputKd = config->pid.kd * (config->pid.vError - config->pid.vErrorLast);
+    IntegrateLimited<1024>(config->pid.outputKi, config->pid.integralRound,
+                     static_cast<int64_t>(config->pid.ki) * config->pid.vError,
+                     static_cast<int64_t>(config->pid.outputKp) + config->pid.outputKd,
+                     context->config.motionParams.ratedCurrent);
 
     config->pid.output = (config->pid.outputKp + config->pid.outputKi + config->pid.outputKd) >> 10;
     if (config->pid.output > context->config.motionParams.ratedCurrent)
@@ -390,17 +416,12 @@ void Motor::Controller::CalcDceToOutput(int32_t _location, int32_t _speed)
 
     config->dce.outputKp = config->dce.kp * config->dce.pError;
 
-    config->dce.integralRound += (config->dce.ki * config->dce.pError + config->dce.kv * config->dce.vError);
-    config->dce.integralRemainder = config->dce.integralRound >> 7;
-    config->dce.integralRound -= (config->dce.integralRemainder << 7);
-    config->dce.outputKi += config->dce.integralRemainder;
-    // limited to ratedCurrent * 1024, should be TUNED when use different scene
-    if (config->dce.outputKi > context->config.motionParams.ratedCurrent << 10)
-        config->dce.outputKi = context->config.motionParams.ratedCurrent << 10;
-    else if (config->dce.outputKi < -(context->config.motionParams.ratedCurrent << 10))
-        config->dce.outputKi = -(context->config.motionParams.ratedCurrent << 10);
-
-    config->dce.outputKd = ((config->dce.kd) * (config->dce.vError));
+    config->dce.outputKd = config->dce.kd * config->dce.vError;
+    IntegrateLimited<128>(config->dce.outputKi, config->dce.integralRound,
+                     static_cast<int64_t>(config->dce.ki) * config->dce.pError +
+                     static_cast<int64_t>(config->dce.kv) * config->dce.vError,
+                     static_cast<int64_t>(config->dce.outputKp) + config->dce.outputKd,
+                     context->config.motionParams.ratedCurrent);
 
     config->dce.output = (config->dce.outputKp + config->dce.outputKi + config->dce.outputKd) >> 10;
     if (config->dce.output > context->config.motionParams.ratedCurrent)
@@ -414,6 +435,13 @@ void Motor::Controller::CalcDceToOutput(int32_t _location, int32_t _speed)
 
 void Motor::Controller::SetCtrlMode(Motor::Mode_t _mode)
 {
+    if (_mode != MODE_STOP && (GetFaultFlags() || motionBlocked)) return;
+    if (_mode == MODE_STOP)
+    {
+        holding = false;
+        holdRequested = false;
+        motionBlocked = true;
+    }
     requestMode = _mode;
 }
 
@@ -427,6 +455,8 @@ void Motor::Controller::AddTrajectorySetPoint(int32_t _pos, int32_t _vel)
 
 void Motor::Controller::SetPositionSetPoint(int32_t _pos)
 {
+    if (GetFaultFlags() || motionBlocked) return;
+    holding = false;
     goalPosition = _pos + context->config.motionParams.encoderHomeOffset;
 }
 
@@ -460,6 +490,7 @@ bool Motor::Controller::SetPositionSetPointWithTime(int32_t _pos, float _time)
 
 void Motor::Controller::SetVelocitySetPoint(int32_t _vel)
 {
+    if (GetFaultFlags() || motionBlocked) return;
     if ((_vel >= -context->config.motionParams.ratedVelocity) &&
         (_vel <= context->config.motionParams.ratedVelocity))
     {
@@ -493,6 +524,7 @@ float Motor::Controller::GetFocCurrent()
 
 void Motor::Controller::SetCurrentSetPoint(int32_t _cur)
 {
+    if (GetFaultFlags() || motionBlocked) return;
     if (_cur > context->config.motionParams.ratedCurrent)
         goalCurrent = context->config.motionParams.ratedCurrent;
     else if (_cur < -context->config.motionParams.ratedCurrent)
@@ -517,8 +549,43 @@ void Motor::Controller::SetBrake(bool _brake)
 
 void Motor::Controller::ClearStallFlag()
 {
-    stalledTime = 0;
-    isStalled = false;
+    // Clearing always leaves the motor stopped and discards the old target.
+    motionBlocked = true;
+    clearFaultsRequested = true;
+}
+
+void Motor::Controller::RequestHold()
+{
+    motionBlocked = true;
+    if (!holding) holdRequested = true;
+}
+
+void Motor::Controller::ReportControlOverrun()
+{
+    if (controlOverrunFlag) return;
+    controlOverrunFlag = true;
+    state = STATE_CONTROL_OVERRUN;
+    RequestHold(); // Locally discard the target even if CAN cannot run yet.
+}
+
+void Motor::Controller::SetEnable(bool enable)
+{
+    if (!enable)
+    {
+        SetCtrlMode(MODE_STOP);
+        return;
+    }
+    if (GetFaultFlags() || clearFaultsRequested) return;
+    motionBlocked = false;
+    holding = false;
+    holdRequested = true; // Capture the current pose on enable, not the old goal.
+}
+
+uint8_t Motor::Controller::GetFaultFlags() const
+{
+    return (overloadFlag ? 1 : 0) | (isStalled ? 2 : 0) |
+           (!context->encoder || !context->encoder->IsCalibrated() ? 4 : 0) |
+           (controlOverrunFlag ? 128 : 0);
 }
 
 
@@ -558,6 +625,7 @@ void Motor::Controller::Init()
 
     modeRunning = MODE_STOP;
     state = STATE_STOP;
+    motionBlocked = !boardConfig.enableMotorOnBoot;
 
     realLapPosition = 0;
     realLapPositionLast = 0;
@@ -591,6 +659,7 @@ void Motor::Controller::Init()
 
     overloadTime = 0;
     overloadFlag = false;
+    controlOverrunFlag = false;
 
     config->pid.vError = 0;
     config->pid.vErrorLast = 0;

@@ -63,10 +63,11 @@ function appendCommandHistory(command, reply, kind = '') {
 }
 
 function commandNeedsConfirmation(command) {
-  return /^[>@&]/.test(command)
+  return /^[>@]/.test(command)
     || /^!START$/.test(command)
     || /^#GRIP(?:\s|_CURRENT\s)/.test(command)
-    || /^#CMDMODE\s/.test(command);
+    || /^#CMDMODE\s/.test(command)
+    || command === '!CLEARFAULT';
 }
 
 async function sendAsciiCommand() {
@@ -128,7 +129,7 @@ function setControlAvailability() {
   $('gripperClose').disabled = !enabled || poseOperationBusy;
   document.querySelectorAll('.joint-slider').forEach((el) => { el.disabled = !enabled || poseOperationBusy; });
   const state = $('controlState');
-  state.textContent = enabled ? `READY · ${app.config?.robot?.joint_speed_deg_s ?? 100}°/s` : 'LOCKED';
+  state.textContent = enabled ? `READY · ${app.config?.robot?.joint_speed_deg_s ?? 30}°/s` : 'LOCKED';
   state.classList.toggle('ready', enabled);
 }
 
@@ -249,7 +250,9 @@ function applyRobotStatus(robot) {
     app.lastCommandedTargets = [...app.robot.joints_deg];
   }
   setLed('robotLed', app.robot.connected, true);
-  $('robotStatus').textContent = app.robot.connected ? (app.robot.enabled ? 'ENABLED' : 'CONNECTED') : 'OFFLINE';
+  const faulted = app.robot.faults?.some((flags) => flags !== 0);
+  $('clearFaults').disabled = !app.robot.connected || app.robot.enabled;
+  $('robotStatus').textContent = app.robot.connected ? (faulted ? 'FAULT' : app.robot.enabled ? 'ENABLED' : 'CONNECTED') : 'OFFLINE';
   $('robotStatus').style.color = app.robot.enabled ? 'var(--green)' : '';
   $('connectRobot').querySelector('span:last-child').textContent = app.robot.connected ? '断开机械臂' : '连接机械臂';
   $('connectRobot').classList.toggle('button-primary', !app.robot.connected);
@@ -268,7 +271,7 @@ function applyRobotStatus(robot) {
     $('telemetryMessage').textContent = app.robot.error;
     $('telemetryMessage').style.color = 'var(--amber)';
   } else {
-    $('telemetryMessage').textContent = app.robot.connected ? '串口遥测正常 · #GETJPOS / #GETLPOS' : '等待机械臂反馈';
+    $('telemetryMessage').textContent = app.robot.connected ? '串口遥测正常 · 状态 / 关节 / TCP' : '等待机械臂反馈';
     $('telemetryMessage').style.color = '';
   }
   const activePose = app.robot.busy || app.localPoseKind;
@@ -414,6 +417,17 @@ async function initSerial() {
     } catch (error) { log(`串口操作失败：${error.message}`, 'error'); toast(error.message, true); }
     finally { button.disabled = false; }
   });
+  $('clearFaults').addEventListener('click', async () => {
+    try {
+      const result = await api('/robot/clear_faults', {});
+      log(result.reply, 'success');
+      await pollStatus();
+      setJointTargets(app.robot.joints_deg);
+      app.lastCommandedTargets = [...app.robot.joints_deg];
+      toast('故障已清除；重新使能后发送新目标');
+    } catch (error) { toast(error.message, true); }
+  });
+
   $('enableRobot').addEventListener('click', async () => {
     try {
       const enabled = !app.robot.enabled;

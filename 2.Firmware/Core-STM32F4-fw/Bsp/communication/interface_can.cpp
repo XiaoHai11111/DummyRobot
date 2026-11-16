@@ -41,7 +41,6 @@ extern CAN_HandleTypeDef hcan2;
 
 CAN_context can1Ctx;
 CAN_context can2Ctx;
-static CAN_context* ctxs = nullptr;
 static CAN_RxHeaderTypeDef headerRx;
 static uint8_t data[8];
 
@@ -58,6 +57,7 @@ struct CAN_context* get_can_ctx(CAN_HandleTypeDef* hcan)
 
 bool StartCanServer(CAN_TypeDef* hcan)
 {
+    CAN_context* ctxs;
     if (hcan == CAN1)
     {
         ctxs = &can1Ctx;
@@ -83,11 +83,11 @@ bool StartCanServer(CAN_TypeDef* hcan)
         .FilterMaskIdHigh = 0x0000,
         .FilterMaskIdLow = 0x0000,
         .FilterFIFOAssignment = CAN_RX_FIFO0,
-        .FilterBank = 0,
+        .FilterBank = hcan == CAN1 ? 0U : 14U,
         .FilterMode = CAN_FILTERMODE_IDMASK,
         .FilterScale = CAN_FILTERSCALE_16BIT, // two 16-bit filters
         .FilterActivation = ENABLE,
-        .SlaveStartFilterBank = 0
+        .SlaveStartFilterBank = 14
     };
     status = HAL_CAN_ConfigFilter(ctxs->handle, &sFilterConfig);
     if (status != HAL_OK)
@@ -119,10 +119,8 @@ void tx_complete_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
 //    if (!ctx) return;
 //    ctx->tx_msg_cnt++;
 
-    if (hcan->Instance == CAN1)
-        osSemaphoreRelease(sem_can1_tx);
-    else if (hcan->Instance == CAN2)
-        osSemaphoreRelease(sem_can2_tx);
+    CAN_context* ctx = get_can_ctx(hcan);
+    if (ctx) ++ctx->TxMailboxCompleteCallbackCnt;
 }
 
 void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
@@ -187,64 +185,40 @@ void HAL_CAN_WakeUpFromRxMsgCallback(CAN_HandleTypeDef* hcan)
 
 void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
 {
-    //__asm volatile ("bkpt");
     CAN_context* ctx = get_can_ctx(hcan);
-    if (!ctx) return;
-    volatile uint32_t original_error = hcan->ErrorCode;
-    (void) original_error;
-
-    // handle transmit errors in all three mailboxes
-    if (hcan->ErrorCode & HAL_CAN_ERROR_TX_ALST0)
+    if (ctx)
     {
-        SET_BIT(hcan->Instance->sTxMailBox[0].TIR, CAN_TI0R_TXRQ);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_ALST0;
-    } else if (hcan->ErrorCode & HAL_CAN_ERROR_TX_TERR0)
-    {
-        tx_error(ctx, 0);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_EWG;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_ACK;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_TERR0;
+        ++ctx->unexpected_errors;
+        ctx->last_error = HAL_CAN_GetError(hcan);
+        ctx->bus_error_status = hcan->Instance->ESR;
     }
-
-    if (hcan->ErrorCode & HAL_CAN_ERROR_TX_ALST1)
-    {
-        SET_BIT(hcan->Instance->sTxMailBox[1].TIR, CAN_TI1R_TXRQ);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_ALST1;
-    } else if (hcan->ErrorCode & HAL_CAN_ERROR_TX_TERR1)
-    {
-        tx_error(ctx, 1);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_EWG;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_ACK;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_TERR1;
-    }
-
-    if (hcan->ErrorCode & HAL_CAN_ERROR_TX_ALST2)
-    {
-        SET_BIT(hcan->Instance->sTxMailBox[2].TIR, CAN_TI2R_TXRQ);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_ALST2;
-    } else if (hcan->ErrorCode & HAL_CAN_ERROR_TX_TERR2)
-    {
-        tx_error(ctx, 2);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_EWG;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_ACK;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_TERR2;
-    }
-
-    if (hcan->ErrorCode)
-        ctx->unexpected_errors++;
+    // AutoBusOff handles bus recovery. Do not re-submit stale motion frames here.
 }
 
-void CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader)
+
+bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader)
 {
-    osStatus semaphore_status;
-    if (canCtx->handle->Instance == CAN1)
-        semaphore_status = osSemaphoreAcquire(sem_can1_tx, osWaitForever);
-    else if (canCtx->handle->Instance == CAN2)
-        semaphore_status = osSemaphoreAcquire(sem_can2_tx, osWaitForever);
-    else
-        return;
-
-    if (semaphore_status == osOK)
-        HAL_CAN_AddTxMessage(canCtx->handle, txHeader, txData, &canCtx->last_heartbeat_mailbox);
+    if (!canCtx || !canCtx->handle) return false;
+    const osSemaphoreId_t semaphore = canCtx->handle->Instance == CAN1 ? sem_can1_tx : sem_can2_tx;
+    // Serialize producers, not TX-complete interrupts. HAL errors/abort/bus-off
+    // cannot consume the only semaphore token permanently.
+    if (osSemaphoreAcquire(semaphore, 2) != osOK) return false;
+    const uint32_t started = HAL_GetTick();
+    while (HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) == 0)
+    {
+        if (HAL_GetTick() - started >= 2)
+        {
+            HAL_CAN_AbortTxRequest(canCtx->handle, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+            ++canCtx->unexpected_errors;
+            osSemaphoreRelease(semaphore);
+            return false;
+        }
+        osDelay(1);
+    }
+    uint32_t mailbox;
+    const bool sent = HAL_CAN_AddTxMessage(canCtx->handle, txHeader, txData, &mailbox) == HAL_OK;
+    if (!sent) ++canCtx->unexpected_errors;
+    else ++canCtx->tx_msg_cnt;
+    osSemaphoreRelease(semaphore);
+    return sent;
 }
-

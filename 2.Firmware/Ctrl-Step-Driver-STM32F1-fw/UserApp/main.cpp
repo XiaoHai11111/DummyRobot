@@ -2,6 +2,7 @@
 #include "configurations.h"
 #include "Platform/Utils/st_hardware.h"
 #include <tim.h>
+#include "Motor/control_timing.h"
 
 
 /* Component Definitions -----------------------------------------------------*/
@@ -14,13 +15,15 @@ Button button1(1, 1000), button2(2, 3000);
 void OnButton1Event(Button::Event _event);
 void OnButton2Event(Button::Event _event);
 Led statusLed;
+ControlTimingStats controlTimingStats;
+static uint32_t controlBudgetCycles;
 
 
 /* Main Entry ----------------------------------------------------------------*/
 void Main()
 {
     uint64_t serialNum = GetSerialNumber();
-    uint16_t defaultNodeID = 6;
+    uint16_t defaultNodeID = 1;
 
     /*---------- Apply EEPROM Settings ----------*/
     // Setting priority is EEPROM > Motor.h
@@ -39,7 +42,7 @@ void Main()
             .calibrationCurrent=2000,
             .dce_kp = 1000,
             .dce_kv = 80,
-            .dce_ki = 300,
+            .dce_ki = 200,
             .dce_kd = 250,
             .enableMotorOnBoot=false,
             .enableStallProtect=false
@@ -74,6 +77,11 @@ void Main()
 
 
     /*------- Start Close-Loop Control Tick ------*/
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    // Reserve 10% of the 50-us period for wrapper/IRQ overhead and CAN service.
+    controlBudgetCycles = (SystemCoreClock / 20000U) * 9U / 10U;
     HAL_Delay(100);
     HAL_TIM_Base_Start_IT(&htim1);  // 100Hz
     HAL_TIM_Base_Start_IT(&htim4);  // 20kHz
@@ -118,7 +126,12 @@ extern "C" void Tim4Callback20kHz()
     if (encoderCalibrator.isTriggered)
         encoderCalibrator.Tick20kHz();
     else
+    {
+        const uint32_t started = DWT->CYCCNT;
         motor.Tick20kHz();
+        if (controlTimingStats.Observe(DWT->CYCCNT - started, controlBudgetCycles))
+            motor.controller->ReportControlOverrun();
+    }
 }
 
 
@@ -137,10 +150,10 @@ void OnButton1Event(Button::Event _event)
             if (motor.controller->modeRunning != Motor::MODE_STOP)
             {
                 boardConfig.defaultMode = motor.controller->modeRunning;
-                motor.controller->requestMode = Motor::MODE_STOP;
+                motor.controller->SetEnable(false);
             } else
             {
-                motor.controller->requestMode = static_cast<Motor::Mode_t>(boardConfig.defaultMode);
+                motor.controller->SetEnable(true);
             }
             break;
     }

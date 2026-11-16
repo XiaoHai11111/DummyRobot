@@ -96,7 +96,7 @@ include_directories(
 
 add_definitions(-DUSE_HAL_DRIVER -DSTM32F4 -DSTM32F4xx -DSTM32F405xx -DconfigAPPLICATION_ALLOCATED_HEAP)
 
-file(GLOB_RECURSE SOURCES
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
         "startup/*.*"
         "Drivers/*.*"
         "Core/*.*"
@@ -118,6 +118,12 @@ link_directories("Drivers/CMSIS/Lib")
 link_libraries("arm_cortexM4lf_math.a")
 
 add_executable(${PROJECT_NAME}.elf ${SOURCES} ${LINKER_SCRIPT})
+
+# Guard the USB/UART ASCII entry and reply frames against inlining regressions.
+# This is a per-function bound, not a proof of the whole task's stack usage.
+set_source_files_properties(
+        UserApp/protocols/ascii_protocol.cpp Bsp/communication/ascii_processor.cpp
+        PROPERTIES COMPILE_OPTIONS "-fstack-usage;-Werror=stack-usage=512")
 
 set(HEX_FILE ${PROJECT_BINARY_DIR}/${PROJECT_NAME}.hex)
 set(BIN_FILE ${PROJECT_BINARY_DIR}/${PROJECT_NAME}.bin)

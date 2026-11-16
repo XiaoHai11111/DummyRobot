@@ -19,8 +19,8 @@ extern osSemaphoreId sem_can2_tx;
 extern osThreadId_t defaultTaskHandle;      // Usage: 2000 Bytes stack
 extern osThreadId_t commTaskHandle;         // Usage: 48000 Bytes stack
 extern osThreadId_t usbIrqTaskHandle;       // Usage: 512  Bytes stack
-extern osThreadId_t usbServerTaskHandle;    // Usage: 2048 Bytes stack
-extern osThreadId_t uartServerTaskHandle;   // Usage: 2048 Bytes stack
+extern osThreadId_t usbServerTaskHandle;    // 4096 Bytes dynamic stack (CCM heap)
+extern osThreadId_t uartServerTaskHandle;   // 4096 Bytes static SRAM stack
 
 /*---------------------------------- User Tasks --------------------------------------*/
 extern osThreadId_t oledTaskHandle;         // Usage: 4000 Bytes stack

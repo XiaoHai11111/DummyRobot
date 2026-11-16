@@ -15,15 +15,17 @@ struct CAN_context
     uint32_t node_ids_in_use_1[4]; // 128 bits (indicats if a node ID was in use 1-2 seconds ago)
 
     uint32_t last_heartbeat_mailbox = 0;
-    uint32_t tx_msg_cnt = 0;
+    volatile uint32_t tx_msg_cnt = 0;
+    volatile uint32_t last_error = 0;
+    volatile uint32_t bus_error_status = 0;
 
     uint8_t node_id_rng_state = 0;
 
     osSemaphoreId_t sem_send_heartbeat;
 
     // count occurrence various callbacks
-    uint32_t TxMailboxCompleteCallbackCnt = 0;
-    uint32_t TxMailboxAbortCallbackCnt = 0;
+    volatile uint32_t TxMailboxCompleteCallbackCnt = 0;
+    volatile uint32_t TxMailboxAbortCallbackCnt = 0;
     int RxFifo0MsgPendingCallbackCnt = 0;
     int RxFifo0FullCallbackCnt = 0;
     int RxFifo1MsgPendingCallbackCnt = 0;
@@ -32,15 +34,15 @@ struct CAN_context
     int WakeUpFromRxMsgCallbackCnt = 0;
     int ErrorCallbackCnt = 0;
 
-    uint32_t received_msg_cnt = 0;
+    volatile uint32_t received_msg_cnt = 0;
     uint32_t received_ack = 0;
-    uint32_t unexpected_errors = 0;
+    volatile uint32_t unexpected_errors = 0;
     uint32_t unhandled_messages = 0;
 };
 
 struct CAN_context* get_can_ctx(CAN_HandleTypeDef* hcan);
 bool StartCanServer(CAN_TypeDef* hcan);
-void CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader);
+bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader);
 void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data);
 
 #endif // __INTERFACE_CAN_HPP

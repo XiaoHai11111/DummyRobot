@@ -49,8 +49,10 @@ public:
 
 private:
     CAN_HandleTypeDef* hcan;
-    uint8_t canBuf[8];
-    CAN_TxHeaderTypeDef txHeader;
+    const CAN_TxHeaderTypeDef baseHeader = {
+        .StdId = 0, .ExtId = 0, .IDE = CAN_ID_STD, .RTR = CAN_RTR_DATA,
+        .DLC = 8, .TransmitGlobalTime = DISABLE
+    };
     float minAngle = 0;
     float maxAngle = 45;
 };
@@ -142,6 +144,15 @@ public:
     bool IsMoving();
     bool IsEnabled();
     void SetCommandMode(uint32_t _mode);
+    void CheckSafety();
+    bool ClearFaults();
+    bool HasFault() const;
+    uint8_t GetFaultJointMask() const;
+    uint8_t GetJointFault(unsigned joint) const { return jointFaults[joint]; }
+    uint32_t GetFaultFeedbackAge(unsigned joint) const { return faultFeedbackAge[joint]; }
+    void StopMotion();
+    bool WaitForMotion(uint32_t timeoutMs = 0);
+    bool IsHolding() const { return holdOnStop; }
 
 
     // Communication protocol definitions
@@ -161,6 +172,7 @@ public:
             make_protocol_object("hand", hand->MakeProtocolDefinitions()),
             make_protocol_function("reboot", *this, &DummyRobot::Reboot),
             make_protocol_function("set_enable", *this, &DummyRobot::SetEnable, "enable"),
+            make_protocol_function("clear_faults", *this, &DummyRobot::ClearFaults),
             make_protocol_function("move_j", *this, &DummyRobot::MoveJ, "j1", "j2", "j3", "j4", "j5", "j6"),
             make_protocol_function("move_l", *this, &DummyRobot::MoveL, "x", "y", "z", "a", "b", "c"),
             make_protocol_function("set_joint_speed", *this, &DummyRobot::SetJointSpeed, "speed"),
@@ -176,13 +188,20 @@ public:
     public:
         explicit CommandHandler(DummyRobot* _context) : context(_context)
         {
-            commandFifo = osMessageQueueNew(16, 64, nullptr);
+            commandFifo = osMessageQueueNew(16, sizeof(Entry), nullptr);
         }
 
-        uint32_t Push(const std::string &_cmd);
-        std::string Pop(uint32_t timeout);
-        uint32_t ParseCommand(const std::string &_cmd);
+        struct Entry
+        {
+            char text[128]{};
+            StreamSink* response = nullptr;
+            uint32_t generation = 0;
+        };
+        uint32_t Push(const std::string &_cmd, StreamSink* response = nullptr);
+        Entry Pop(uint32_t timeout);
+        uint32_t ParseCommand(const Entry &entry);
         uint32_t GetSpace();
+        uint32_t GetGeneration() const { return generation; }
         void ClearFifo();
         void EmergencyStop();
 
@@ -190,18 +209,27 @@ public:
     private:
         DummyRobot* context;
         osMessageQueueId_t commandFifo;
-        char strBuffer[64]{};
+        volatile uint32_t generation = 0;
     };
     CommandHandler commandHandler = CommandHandler(this);
 
 
 private:
+    bool MoveJAtGeneration(float j1, float j2, float j3, float j4, float j5, float j6, uint32_t generation);
+    bool MoveLAtGeneration(float x, float y, float z, float a, float b, float c, uint32_t generation);
     CAN_HandleTypeDef* hcan;
     float jointSpeed = DEFAULT_JOINT_SPEED;
     float jointSpeedRatio = 1;
     DOF6Kinematic::Joint6D_t dynamicJointSpeeds = {1, 1, 1, 1, 1, 1};
     DOF6Kinematic* dof6Solver;
-    bool isEnabled = false;
+    volatile bool isEnabled = false;
+    volatile bool recovering = false;
+    volatile bool holdOnStop = false;
+    volatile uint8_t jointFaults[7]{};
+    volatile uint32_t faultFeedbackAge[7]{};
+    uint32_t safetyStarted = 0;
+    uint32_t motionTimeoutMs = 30000;
+    uint32_t enabledAt = 0;
 };
 
 

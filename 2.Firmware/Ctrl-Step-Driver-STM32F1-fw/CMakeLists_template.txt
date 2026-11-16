@@ -63,7 +63,7 @@ include_directories(
 
 add_definitions(-DUSE_HAL_DRIVER -D__MICROLIB -DSTM32F1 -DSTM32F1xx -DSTM32F103xB)
 
-file(GLOB_RECURSE SOURCES
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
         "startup/*.*"
         "Drivers/*.*"
         "Core/*.*"
@@ -78,7 +78,16 @@ add_link_options(-Wl,-gc-sections,--print-memory-usage,-Map=${PROJECT_BINARY_DIR
 add_link_options(-mcpu=cortex-m3 -mthumb -mthumb-interwork)
 add_link_options(-T ${LINKER_SCRIPT})
 
+# The 20-kHz ISR has a 50-us deadline, including Debug builds. Keep symbols,
+# but optimize every normal control/encoder/driver path without fast-math.
+set_source_files_properties(
+        Ctrl/Motor/motor.cpp Ctrl/Motor/motion_planner.cpp
+        Ctrl/Sensor/Encoder/mt6816_base.cpp Ctrl/Driver/tb67h450_base.cpp
+        Port/mt6816_stm32.cpp Port/tb67h450_stm32.cpp UserApp/main.cpp
+        PROPERTIES COMPILE_OPTIONS "-O2;-fno-fast-math")
+
 add_executable(${PROJECT_NAME}.elf ${SOURCES} ${LINKER_SCRIPT})
+set_property(TARGET ${PROJECT_NAME}.elf APPEND PROPERTY LINK_DEPENDS ${LINKER_SCRIPT})
 
 set(HEX_FILE ${PROJECT_BINARY_DIR}/${PROJECT_NAME}.hex)
 set(BIN_FILE ${PROJECT_BINARY_DIR}/${PROJECT_NAME}.bin)

@@ -22,6 +22,7 @@ void ThreadControlLoopFixUpdate(void* argument)
         // Suspended here until got Notification.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        dummy.CheckSafety();
         if (dummy.IsEnabled())
         {
             // Send control command to Motors & update Joint states
@@ -42,7 +43,13 @@ void ThreadControlLoopFixUpdate(void* argument)
         } else
         {
             // Just update Joint states
-            dummy.UpdateJointAngles();
+            static uint32_t lastPoll = 0;
+            if (HAL_GetTick() - lastPoll >= 20)
+            {
+                lastPoll = HAL_GetTick();
+                if (dummy.IsHolding()) dummy.motorJ[ALL]->Hold();
+                dummy.UpdateJointAngles();
+            }
             dummy.UpdateJointPose6D();
         }
     }
@@ -72,10 +79,15 @@ void ThreadOledUpdate(void* argument)
 
         oled.clearBuffer();
         oled.setFont(u8g2_font_5x8_tr);
-        oled.setCursor(0, 10);
-        oled.printf("IMU:%.3f/%.3f", mpu6050.data.ax, mpu6050.data.ay);
-        oled.setCursor(85, 10);
-        oled.printf("| FPS:%lu", 1000000 / (micros() - t));
+        // Keep diagnosis visible even when the serial link cannot return text.
+        oled.setCursor(0, 7);
+        oled.printf("U%u S%lu R%03lu P%03lu T%03lu", unsigned(UsbDeviceState()),
+                    usb_stats_.task_running, usb_stats_.cdc_rx_packets % 1000,
+                    usb_stats_.cdc_rx_processed % 1000, usb_stats_.cdc_tx_complete % 1000);
+        oled.setCursor(0, 14);
+        const uint32_t elapsed = micros() - t;
+        oled.printf("Q%03lu E%03lu FPS:%lu", usb_stats_.tx_cnt % 1000,
+                    usb_stats_.tx_failures % 1000, elapsed ? 1000000 / elapsed : 0);
         t = micros();
 
         oled.drawBox(0, 15, 128, 3);
@@ -102,7 +114,29 @@ void ThreadOledUpdate(void* argument)
 
         oled.setFont(u8g2_font_10x20_tr);
         oled.setCursor(0, 78);
-        if (dummy.IsEnabled())
+        const uint8_t faultMask = dummy.GetFaultJointMask();
+        if (faultMask)
+        {
+            // Rotate through affected joints; raw flags preserve combined faults.
+            unsigned affected[6], count = 0;
+            for (unsigned joint = 1; joint <= 6; ++joint)
+                if (faultMask & (1U << (joint - 1))) affected[count++] = joint;
+            const unsigned joint = affected[(HAL_GetTick() / 1500U) % count];
+            const unsigned flags = dummy.GetJointFault(joint);
+            const char* reason = flags & 128U ? "CONTROL OVERRUN" :
+                                 flags & 8U ? "CAN TIMEOUT" :
+                                 flags & 16U ? "OLD F1 PROTOCOL" :
+                                 flags & 4U ? "NO CALIBRATION" :
+                                 flags & 2U ? "STALL" :
+                                 flags & 1U ? "OVERLOAD" :
+                                 flags & 64U ? "DRIVER STOP" :
+                                 flags & 32U ? "MOVE TIMEOUT" : "CLEARED";
+            oled.setFont(u8g2_font_6x12_tr);
+            oled.setCursor(0, 68);
+            oled.printf("FAULT 0x%02X J%u:%02X", static_cast<unsigned>(faultMask), joint, flags);
+            oled.setCursor(0, 80);
+            oled.printf("%s", reason);
+        } else if (dummy.IsEnabled())
         {
             for (int i = 1; i <= 6; i++)
                 buf[i - 1] = (dummy.jointsStateFlag & (1 << i) ? '*' : '_');
