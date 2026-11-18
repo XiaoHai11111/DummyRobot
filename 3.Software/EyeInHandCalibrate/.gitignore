@@ -59,3 +59,4 @@ release/
 !.gitignore
 
 hand_in/collect_data_in_dummyrobot.bak.*
+hand_in/bak
