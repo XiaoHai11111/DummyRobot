@@ -148,6 +148,7 @@ void ThreadOledUpdate(void* argument)
         }
 
         oled.sendBuffer();
+        osDelay(1);  // Yield so display/IMU refresh cannot monopolise a priority level.
     }
 }
 

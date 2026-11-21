@@ -14,8 +14,9 @@
 #define true 1
 #define false 0
 
-// 1000ms default read timeout (modify with "I2Cdev::readTimeout = [ms];")
-#define I2CDEV_DEFAULT_READ_TIMEOUT     1000
+// Calibration does not need IMU data; a stalled sensor read must never hold a
+// Normal-priority task for a second. 14 bytes at 100 kHz need ~2 ms, 20 ms is ample.
+#define I2CDEV_DEFAULT_READ_TIMEOUT     20
 
 void I2Cdev_init(I2C_HandleTypeDef *hi2c);
 

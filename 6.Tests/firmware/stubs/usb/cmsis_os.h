@@ -7,6 +7,7 @@ using osStatus = int;
 using osPriority_t = int;
 constexpr uint32_t osWaitForever = UINT32_MAX;
 constexpr int osPriorityNormal = 24;
+constexpr int osPriorityAboveNormal = 32;
 struct osThreadAttr_t {
     const char* name;
     uint32_t attr_bits = 0;
