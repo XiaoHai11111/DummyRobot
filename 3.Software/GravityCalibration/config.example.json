@@ -1,0 +1,17 @@
+{
+  "pose_id": "P0",
+  "joint": 1,
+  "fixed_pose_deg": [0, 0, 90, 0, 0, 0],
+  "sweep_min_deg": -155,
+  "sweep_max_deg": 155,
+  "speed_deg_s": 1.0,
+  "cycles": 5,
+  "sample_hz": 20,
+  "endpoint_hold_s": 1.0,
+  "current_limit_a": 3.0,
+  "payload_description": "gripper, camera",
+  "temperature_note": "0s",
+  "firmware_revision": "v0.0.0.3",
+  "operator_reviewed_workspace": true
+}
+

@@ -1,0 +1,4 @@
+numpy>=1.24
+pyserial>=3.5
+# Optional: gravity_preview.py uses the existing DummyRobot environment's mujoco.
+
