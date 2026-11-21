@@ -14,6 +14,23 @@ void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* d
         /*----------------------- ↓ Add Your CAN1 Packet Protocol Here ↓ ------------------------*/
         switch (cmd)
         {
+            case 0x21: // Signed controller current command, amperes (not measured current).
+            case 0x22: // Encoder-estimated motor velocity, turns/s.
+            {
+                if (rxHeader->IDE != CAN_ID_STD || rxHeader->RTR != CAN_RTR_DATA ||
+                    id < 1 || id > 6 || rxHeader->DLC != 8 || data[7] != 0xA1 || data[5] > 6)
+                    return;
+                float value;
+                uint32_t bits;
+                memcpy(&value, data, sizeof(value));
+                memcpy(&bits, data, sizeof(bits));
+                const float limit = cmd == 0x21 ? 3.3f : 40000.0f;
+                if ((bits & 0x7F800000U) == 0x7F800000U || value < -limit || value > limit)
+                    return;
+                if (cmd == 0x21) dummy.motorJ[id]->UpdateCurrentCommand(value, data[6]);
+                else dummy.motorJ[id]->UpdateVelocity(value, data[6]);
+                break;
+            }
             case 0x23:
             {
                 if (rxHeader->IDE != CAN_ID_STD || rxHeader->RTR != CAN_RTR_DATA ||

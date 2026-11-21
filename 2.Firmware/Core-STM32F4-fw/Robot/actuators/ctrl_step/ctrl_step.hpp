@@ -66,6 +66,17 @@ public:
     bool ClearFaults();
     bool ReadControlTiming();
     void UpdateControlTiming(uint16_t last, uint16_t peak, uint32_t overruns);
+    // Diagnostic samples are asynchronous CAN replies, not an F1 atomic snapshot.
+    struct Telemetry
+    {
+        float positionDeg, velocityDegS, currentCommandA;
+        uint32_t positionTick, velocityTick, currentTick;
+        uint8_t driverState, faultFlags;
+        bool statusSupported;
+    };
+    bool ReadTelemetry(Telemetry& sample);
+    void UpdateCurrentCommand(float amps, uint8_t faults);
+    void UpdateVelocity(float turnsPerSecond, uint8_t faults);
     void Hold();
 
 
@@ -101,6 +112,10 @@ public:
 
 
 private:
+    volatile float currentCommandA = 0, velocityTurnsPerSecond = 0;
+    volatile uint32_t currentTick = 0, velocityTick = 0;
+    volatile uint32_t currentReplyCount = 0, velocityReplyCount = 0;
+    volatile uint8_t currentFaults = 0, velocityFaults = 0;
     CAN_HandleTypeDef* hcan;
     const CAN_TxHeaderTypeDef baseHeader = {
         .StdId = 0,

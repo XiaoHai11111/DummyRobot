@@ -340,6 +340,58 @@ void CtrlStepMotor::Hold()
     CanSendMessage(get_can_ctx(hcan), data, &header);
 }
 
+void CtrlStepMotor::UpdateCurrentCommand(float amps, uint8_t faults)
+{
+    currentCommandA = amps; // Motor direction, NOT ADC-measured current.
+    currentFaults = faults;
+    currentTick = HAL_GetTick();
+    ++currentReplyCount;
+}
+
+void CtrlStepMotor::UpdateVelocity(float turnsPerSecond, uint8_t faults)
+{
+    velocityTurnsPerSecond = turnsPerSecond;
+    velocityFaults = faults;
+    velocityTick = HAL_GetTick();
+    ++velocityReplyCount;
+    // Neither diagnostic reply refreshes position feedback / the safety watchdog.
+}
+
+bool CtrlStepMotor::ReadTelemetry(Telemetry& sample)
+{
+    if (nodeID < 1 || nodeID > 6) return false;
+    const uint32_t previousPosition = feedbackCount;
+    const uint32_t previousCurrent = currentReplyCount;
+    const uint32_t previousVelocity = velocityReplyCount;
+    CAN_TxHeaderTypeDef header = baseHeader;
+    uint8_t data[8] = {};
+    for (uint8_t command : {0x21, 0x22, 0x23})
+    {
+        header.StdId = nodeID << 7 | command;
+        if (!CanSendMessage(get_can_ctx(hcan), data, &header)) return false;
+    }
+    const uint32_t started = HAL_GetTick();
+    while (feedbackCount == previousPosition || currentReplyCount == previousCurrent ||
+           velocityReplyCount == previousVelocity)
+    {
+        if (HAL_GetTick() - started >= 50) return false;
+        osDelay(1);
+    }
+    // Copy only; never send, wait or format text with interrupts masked.
+    taskENTER_CRITICAL();
+    sample.positionDeg = angle;
+    sample.velocityDegS = velocityTurnsPerSecond * (inverseDirection ? -360.0f : 360.0f) / reduction;
+    sample.currentCommandA = currentCommandA;
+    sample.positionTick = lastFeedbackTick;
+    sample.velocityTick = velocityTick;
+    sample.currentTick = currentTick;
+    sample.driverState = driverState;
+    sample.faultFlags = faultFlags | currentFaults | velocityFaults;
+    sample.statusSupported = statusSupported;
+    taskEXIT_CRITICAL();
+    return true;
+}
+
 
 void CtrlStepMotor::SetDceKp(int32_t _val)
 {

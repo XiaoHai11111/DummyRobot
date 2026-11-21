@@ -12,6 +12,7 @@ struct Frame { CAN_TxHeaderTypeDef header; std::array<uint8_t, 8> data; };
 static std::vector<Frame> frames;
 CAN_HandleTypeDef handle, hcan1;
 static bool preemptSend = false, replyToTiming = true;
+static bool replyToTelemetry = true, malformedTelemetry = false;
 DummyRobot dummy(&handle);
 CAN_context context{&handle};
 CAN_context* get_can_ctx(CAN_HandleTypeDef*) { return &context; }
@@ -41,6 +42,15 @@ bool CanSendMessage(CAN_context*, uint8_t* data, CAN_TxHeaderTypeDef* header) {
     }
     if ((header->StdId & 0x7f) == 0x25 && replyToTiming)
         dummy.motorJ[header->StdId >> 7]->UpdateControlTiming(1200, 1900, 2);
+    const unsigned cmd = header->StdId & 0x7f;
+    if (replyToTelemetry && cmd >= 0x21 && cmd <= 0x23) {
+        uint8_t reply[8]{}; reply[5] = 2; reply[7] = 0xA1;
+        const float v = cmd == 0x21 ? -0.5f : cmd == 0x22 ? 0.25f : 1.0f;
+        memcpy(reply, &v, 4);
+        CAN_RxHeaderTypeDef rx{header->StdId, 0, CAN_ID_STD, CAN_RTR_DATA,
+                              malformedTelemetry && cmd != 0x23 ? 4U : 8U, 0};
+        OnCanMessage(&context, &rx, reply);
+    }
     Frame f{*header, {}}; memcpy(f.data.data(), data, 8); frames.push_back(f); return transmit;
 }
 float value(const Frame &f, unsigned offset) { float v; memcpy(&v, f.data.data() + offset, 4); return v; }
@@ -94,7 +104,36 @@ int main() {
     ascii("#GETTIMING 1", usb); assert(usb.output.find("error F1 timing response timeout") == 0);
     assert(now - timingStart == 50);
     replyToTiming = true;
+    dummy.SetEnable(false);
+    ascii("#GETTELEM 0", usb); assert(usb.output.find("error") == 0);
+    ascii("#GETTELEM 7", usb); assert(usb.output.find("error") == 0);
+    ascii("#GETTELEM 2 extra", usb); assert(usb.output.find("error") == 0);
+    now = 10;
+    ascii("#GETTELEM 2", usb);
+    assert(usb.output == "okm 2 10 10 10 -87.00000 -3.00000 -0.5000 2 0 1\r\n");
+    replyToTelemetry = false;
+    const auto telemetryStart = now;
+    ascii("#GETTELEM 2", usb); assert(usb.output.find("error F1 telemetry timeout") == 0);
+    assert(now - telemetryStart == 50);
+    replyToTelemetry = true; malformedTelemetry = true;
+    ascii("#GETTELEM 2", usb); assert(usb.output.find("error F1 telemetry timeout") == 0);
+    malformedTelemetry = false;
+    // Diagnostics must never mask lost position/status feedback.
+    now = 150;
+    const auto feedbackTick = dummy.motorJ[2]->lastFeedbackTick;
+    const auto feedbackCounter = dummy.motorJ[2]->feedbackCount;
+    uint8_t diag[8]{}; diag[7] = 0xA1; diag[5] = 2;
+    CAN_RxHeaderTypeDef diagHeader{2U << 7 | 0x21, 0, CAN_ID_STD, CAN_RTR_DATA, 8, 0};
+    const float diagnosticCurrent = 0.25f; memcpy(diag, &diagnosticCurrent, 4);
+    OnCanMessage(&context, &diagHeader, diag);
+    diagHeader.StdId = 2U << 7 | 0x22;
+    OnCanMessage(&context, &diagHeader, diag);
+    assert(dummy.motorJ[2]->lastFeedbackTick == feedbackTick);
+    assert(dummy.motorJ[2]->feedbackCount == feedbackCounter);
     now = 0; fresh();
+    for (unsigned j = 1; j <= 6; ++j) dummy.motorJ[j]->UpdateAngleCallback(0, true);
+    dummy.UpdateJointAnglesCallback();
+    dummy.SetEnable(true);
     // INT replaces pending work. SEQ preserves all points, then rejects overflow.
     assert(dummy.commandHandler.Push(">1,-75,180,0,0,0") == 15);
     assert(dummy.commandHandler.Push(">2,-75,180,0,0,0") == 15);

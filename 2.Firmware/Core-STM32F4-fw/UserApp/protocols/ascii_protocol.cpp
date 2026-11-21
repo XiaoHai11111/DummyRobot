@@ -79,6 +79,27 @@ static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
                 Respond(response, "okt %u %u %u %lu", joint, unsigned(motor->controlLastCycles),
                         unsigned(motor->controlMaxCycles), static_cast<unsigned long>(motor->controlOverruns));
         }
+    } else if (text.rfind("#GETTELEM ", 0) == 0)
+    {
+        unsigned joint;
+        char extra;
+        if (sscanf(cmd, "#GETTELEM %u %c", &joint, &extra) != 1 || joint < 1 || joint > 6)
+            Respond(response, "error invalid joint (1..6)");
+        else
+        {
+            CtrlStepMotor::Telemetry sample{};
+            if (!dummy.motorJ[joint]->ReadTelemetry(sample))
+                Respond(response, "error F1 telemetry timeout (requires extended 0x21/0x22/0x23)");
+            else
+                Respond(response, "okm %u %lu %lu %lu %.5f %.5f %.4f %u %u %u", joint,
+                        static_cast<unsigned long>(sample.positionTick),
+                        static_cast<unsigned long>(sample.velocityTick),
+                        static_cast<unsigned long>(sample.currentTick),
+                        sample.positionDeg + dummy.initPose.a[joint - 1],
+                        sample.velocityDegS, sample.currentCommandA,
+                        unsigned(sample.driverState), unsigned(sample.faultFlags),
+                        unsigned(sample.statusSupported));
+        }
     } else if (text == "#GETJPOS")
     {
         Respond(response, "okj %.2f %.2f %.2f %.2f %.2f %.2f",
