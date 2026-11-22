@@ -16,7 +16,8 @@ from pathlib import Path
 import sys
 import time
 
-from calibration import FIELDS, JOINT_LIMITS_DEG, Q_FIELDS, tick_skew_ms
+from calibration import (FIELDS, JOINT_LIMITS_DEG, Q_FIELDS, tick_delta_ms,
+                         tick_skew_ms)
 
 
 class Link:
@@ -49,7 +50,7 @@ class Link:
                 if len(self._rx) > 512:
                     raise RuntimeError("Overlong serial reply")
 
-    def request(self, command, prefix, timeout=0.5, retries=0):
+    def request(self, command, prefix, timeout=0.5, retries=0, joint=None):
         # Only read-only queries may be retried. Motion/enable commands keep
         # retries=0 so a lost reply can never cause a duplicate side effect.
         for attempt in range(retries + 1):
@@ -71,6 +72,11 @@ class Link:
                 # should be mistaken for a telemetry response. USB CDC can deliver
                 # several complete lines in one read, so later lines stay buffered.
                 if (prefix == "queue" and text.isdigit()) or text.startswith(prefix):
+                    if command.startswith("#GETTELEM ") and joint is not None:
+                        fields = text.split()
+                        if len(fields) < 2 or fields[1] != str(joint):
+                            self._log(f"DISCARD wrong joint reply: {text}")
+                            continue
                     self._log(f"MATCH {prefix}")
                     self.last_attempt_start = attempt_start
                     self.last_reply_time = time.monotonic()
@@ -147,7 +153,7 @@ def run(link, config, writer, file):
     q0 = []
     for axis in range(1, 7):
         sample, q = parse_telemetry(
-            link.request(f"#GETTELEM {axis}", "okm ", timeout=1.0, retries=2), axis)
+            link.request(f"#GETTELEM {axis}", "okm ", timeout=1.0, retries=2, joint=axis), axis)
         if sample["fault_flags"] or not sample["status_supported"] or sample["skew_ms"] > 10:
             raise RuntimeError(f"J{axis}: invalid initial telemetry")
         q0.append(q)
@@ -174,13 +180,16 @@ def run(link, config, writer, file):
                     + config["endpoint_hold_s"] + 15)
         tolerance = config.get("endpoint_position_tolerance_deg", 0.3)
         max_span = config.get("endpoint_position_span_deg", 0.1)
-        max_gap = max(0.25, 3.0 / config["sample_hz"])
-        position_window = deque()  # (monotonic timestamp, joint position)
+        # Endpoint hold uses F4/CAN receive ticks, not host arrival time: a
+        # serial retry must not invalidate an already stable endpoint.
+        max_tick_gap_ms = 5000
+        hold_ms = config["endpoint_hold_s"] * 1000
+        position_window = deque()  # (F4 position_tick_ms, joint position)
         arrived_at = None
-        last_sample_at = None
+        last_tick_ms = None
         while True:
             before = time.monotonic()
-            wire = link.request(f"#GETTELEM {j}", "okm ", timeout=1.0, retries=2)
+            wire = link.request(f"#GETTELEM {j}", "okm ", timeout=1.0, retries=2, joint=j)
             after = getattr(link, "last_reply_time", None) or time.monotonic()
             if getattr(link, "last_attempt_start", None) is not None:
                 before = link.last_attempt_start
@@ -214,35 +223,38 @@ def run(link, config, writer, file):
                 raise RuntimeError("A held joint moved more than 0.5 degrees")
             if not config["sweep_min_deg"] - 0.5 <= q_active <= config["sweep_max_deg"] + 0.5:
                 raise RuntimeError("Active joint left the reviewed interval")
-            # Decide endpoint stability using measured *position*, not the
-            # noisy instantaneous F1 velocity estimate. All samples in the
-            # stable interval must stay near the target, and the whole
-            # interval must have a small peak-to-peak position variation.
-            now = time.monotonic()
-            if last_sample_at is not None and now - last_sample_at > max_gap:
-                position_window.clear()  # never bridge missing telemetry
-                arrived_at = None
-            last_sample_at = now
+            # Decide endpoint stability using measured *position* and F4/CAN
+            # receive ticks. Host-side retries delay arrival but do not mean
+            # the robot left the endpoint, so they must not reset the hold.
+            tick_ms = int(sample["position_tick_ms"])
+            if last_tick_ms is not None:
+                tick_gap = tick_delta_ms(last_tick_ms, tick_ms)
+                if tick_gap == 0 or tick_gap > max_tick_gap_ms:
+                    position_window.clear()  # never bridge missing feedback
+                    arrived_at = None
+            last_tick_ms = tick_ms
 
             if abs(q_active - target) >= tolerance:
                 position_window.clear()
                 arrived_at = None
             else:
-                position_window.append((now, q_active))
+                position_window.append((tick_ms, q_active))
                 # Drop oldest positions until the full window is quiet.
                 while position_window and (max(p for _, p in position_window)
                                            - min(p for _, p in position_window)) >= max_span:
                     position_window.popleft()
-                # Do not accept a single isolated sample as a full hold.
-                arrived_at = position_window[0][0] if position_window else None
+                # Require at least two samples so one isolated reading cannot
+                # satisfy the hold; use F4 ticks so retries are transparent.
+                arrived_at = position_window[0][0] if len(position_window) >= 2 else None
                 if (arrived_at is not None
-                        and len(position_window) >= 5
-                        and now - arrived_at >= config["endpoint_hold_s"]):
+                        and tick_delta_ms(arrived_at, tick_ms) >= hold_ms):
+                    held_s = tick_delta_ms(arrived_at, tick_ms) / 1000.0
                     print(f"J{j} {phase}: target={target:.3f} deg, "
                           f"actual={q_active:.4f} deg; stable for "
-                          f"{now-arrived_at:.2f} s", flush=True)
+                          f"{held_s:.2f} s", flush=True)
                     break
 
+            now = time.monotonic()
             if now > deadline:
                 span = (max(p for _, p in position_window)
                         - min(p for _, p in position_window)) if position_window else float("nan")

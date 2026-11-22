@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from calibration import (FIELDS, fit_local, make_pairs, predict_local,
-                         limited_feedforward, tick_skew_ms)
+                         limited_feedforward, tick_delta_ms, tick_skew_ms)
 from collect import Link, parse_telemetry, validate_config, run
 from demo_data import generate
 
@@ -67,6 +67,7 @@ class CalibrationTests(unittest.TestCase):
 
     def test_wire_units_and_tick_wrap(self):
         self.assertEqual(tick_skew_ms([2**32 - 2, 0, 1]), 3)
+        self.assertEqual(tick_delta_ms(2**32 - 2, 1), 3)
         row, q = parse_telemetry("okm 2 100 101 102 -30.0 2.0 -0.5 2 0 1".split(), 2)
         self.assertEqual((q, row["dq_deg_s"], row["i_cmd_motor_a"], row["skew_ms"]),
                          (-30.0, 2.0, -0.5, 2))
@@ -100,6 +101,24 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(link.request(">", "queue"), ["15"])
         data = link.request("#GETTELEM 2", "okm ")
         self.assertEqual(parse_telemetry(data, 2)[1], -30)
+
+    def test_stale_other_joint_reply_is_discarded(self):
+        class Port:
+            def __init__(self):
+                self.chunks = [b"okm 1 100 101 102 -30 2 -0.5 2 0 1\r\n",
+                               b"okm 2 100 101 102 0 2 -0.5 2 0 1\r\n"]
+
+            def write(self, data):
+                pass
+
+            def read_until(self, delimiter):
+                return self.chunks.pop(0) if self.chunks else b""
+
+        link = Link(Port())
+        data = link.request("#GETTELEM 2", "okm ", timeout=0.01,
+                            retries=1, joint=2)
+        self.assertEqual(data[1], "2")
+        self.assertEqual(link.retries, 0)
 
     def test_read_only_query_retry_on_silent_drop(self):
         class Port:
@@ -149,7 +168,8 @@ class CalibrationTests(unittest.TestCase):
                 self.target = 0.0
                 self.enabled = 0
                 self.commands = []
-            def request(self, command, prefix, timeout=0.5, retries=0):
+                self.tick = 100
+            def request(self, command, prefix, timeout=0.5, retries=0, joint=None):
                 self.commands.append(command)
                 if command == "!STOP":
                     self.enabled = 0
@@ -172,7 +192,8 @@ class CalibrationTests(unittest.TestCase):
                     if axis == 2 and self.enabled and abs(self.target - self.q[1]) > 1e-5:
                         velocity = float(np.sign(self.target - self.q[1]))
                         self.q[1] += float(np.clip(self.target - self.q[1], -0.05, 0.05))
-                    return f"okm {axis} 100 101 102 {self.q[axis-1]} {velocity} -0.2 2 0 1".split()
+                    self.tick += 50
+                    return f"okm {axis} {self.tick} {self.tick-1} {self.tick-2} {self.q[axis-1]} {velocity} -0.2 2 0 1".split()
                 if command == "#GETJPOS":
                     return ["okj", *map(str, self.q)]
                 raise AssertionError(command)

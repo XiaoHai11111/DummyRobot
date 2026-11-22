@@ -28,6 +28,11 @@ def tick_skew_ms(ticks):
     return max(offsets) - min(offsets)
 
 
+def tick_delta_ms(previous, current):
+    """Forward uint32 millisecond delta, safe across the 49.7 day wrap."""
+    return (int(current) - int(previous)) % 2**32
+
+
 def sine_design(q_rad):
     q = np.asarray(q_rad)
     return np.column_stack([np.sin(q), np.cos(q), np.ones_like(q)])
