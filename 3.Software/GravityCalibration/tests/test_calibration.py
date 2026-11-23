@@ -38,6 +38,25 @@ class CalibrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Other joints moved"):
                 make_pairs([path], 2, 3.0)
 
+    def test_noisy_f1_velocity_does_not_break_pairing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.csv"
+            generate(path, 32)
+            with path.open() as file:
+                rows = list(csv.DictReader(file))
+            for row in rows:
+                row["dq_deg_s"] = "0"
+            with path.open("w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            pairs, _ = make_pairs([path], 2, 3.0)
+            coefficients, metrics = fit_local(pairs)
+            np.testing.assert_allclose(coefficients, [0.3, 0.6, 0.05], atol=0.015)
+            self.assertLess(metrics["train_rmse_a"], 0.003)
+            with self.assertRaisesRegex(ValueError, "matched"):
+                make_pairs([path], 2, 3.0, velocity_source="f1")
+
     def test_invalid_data_and_saturation_fail_closed(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "test.csv"

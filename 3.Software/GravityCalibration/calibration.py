@@ -53,8 +53,13 @@ def load_rows(path):
 
 def make_pairs(paths, joint, current_limit_a, *, bin_deg=1.0,
                min_speed_deg_s=0.3, max_accel_deg_s2=2.0,
-               max_skew_ms=10.0, pose_tolerance_deg=0.5):
+               max_skew_ms=10.0, pose_tolerance_deg=0.5,
+               velocity_source="position"):
     """Pair equal-position/equal-speed forward and reverse runs within each cycle.
+
+    The F1 encoder speed estimate is very noisy at higher commanded speeds, so
+    filtering normally uses the smoother speed derived from measured joint angle.
+    Raw F1 speed remains in the CSV. Set velocity_source="f1" to use it directly.
 
     Averages remove only approximately odd friction. Returned gravity current
     can still contain sensor/drive bias, cables, and asymmetric transmission loss.
@@ -63,6 +68,8 @@ def make_pairs(paths, joint, current_limit_a, *, bin_deg=1.0,
         raise ValueError("Invalid joint or verified current limit")
     if not bin_deg > 0 or not pose_tolerance_deg > 0:
         raise ValueError("Bin width and pose tolerance must be positive")
+    if velocity_source not in ("position", "f1"):
+        raise ValueError("velocity_source must be 'position' or 'f1'")
     pairs, poses, total, retained = [], [], 0, 0
     pose_ids = set()
     for path in paths:
@@ -76,13 +83,17 @@ def make_pairs(paths, joint, current_limit_a, *, bin_deg=1.0,
         values = np.array([[float(row[k]) for k in keys] for row in rows])
         if not np.isfinite(values).all():
             raise ValueError(f"{path}: non-finite sample")
-        t, v, current = values[:, 0], values[:, 1], values[:, 2] * MOTOR_SIGNS[joint - 1]
+        t, f1_velocity, current = values[:, 0], values[:, 1], values[:, 2] * MOTOR_SIGNS[joint - 1]
         if np.any(np.diff(t) <= 0):
             raise ValueError(f"{path}: time must increase strictly")
-        # Velocity is the F1 encoder estimate, not the motion setpoint.
+        q_all = values[:, -6:]
+        if velocity_source == "position":
+            v = np.gradient(q_all[:, joint - 1], t)
+            v = np.convolve(np.pad(v, (2, 2), mode="edge"), np.ones(5) / 5, mode="valid")
+        else:
+            v = f1_velocity
         smoothed = np.convolve(np.pad(v, (2, 2), mode="edge"), np.ones(5) / 5, mode="valid")
         acceleration = np.gradient(smoothed, t)
-        q_all = values[:, -6:]
         poses.append(q_all)
         good = ((abs(v) >= min_speed_deg_s) & (abs(acceleration) <= max_accel_deg_s2)
                 & (abs(current) < 0.9 * current_limit_a)
