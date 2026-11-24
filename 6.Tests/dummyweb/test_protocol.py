@@ -62,16 +62,40 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["reply"], "15")
         self.assertEqual(self.link.last_joints, before)
 
-    def test_old_prefix_and_invalid_extensions_are_rejected(self):
-        for command in ["&0,-75,180,0,0,0,30", ">0,-75,180,0,0,0,30,46",
-                        ">0,-75,180,0,0,0,30,40,2", ">nan,-75,180,0,0,0,30",
-                        ">0,-75,180,0,0,0,30,40,0.5,9", "@0,0,0,0,0,0,30,40"]:
+    def test_terminal_forwards_any_single_ascii_line(self):
+        commands = ["&0,-75,180,0,0,0,30", ">0,-75,180,0,0,0,30,46",
+                    ">0,-75,180,0,0,0,30,40,2", ">nan,-75,180,0,0,0,30",
+                    ">0,-75,180,0,0,0,30,40,0.5,9", "@0,0,0,0,0,0,30,40",
+                    ">0,-75,180,0,0,0,60", "#GRAVITY_FF_ON", "#DRAG_GAIN 0.01 0.25 1.0",
+                    "  #UNKNOWN  "]
+        for command in commands:
+            with self.subTest(command=command):
+                if command == "  #UNKNOWN  ":
+                    device = self.link.device
+                    original_write = device.write
+                    written = []
+
+                    def capture(data):
+                        written.append(data)
+                        return original_write(data)
+
+                    device.write = capture
+                    self.assertEqual(self.link.send_user_command(command)["reply"], "ok")
+                    self.assertEqual(written, [b"  #UNKNOWN  \r\n"])
+                    device.write = original_write
+                else:
+                    self.assertEqual(self.link.send_user_command(command)["reply"], "ok")
+        self.assertEqual(self.link.device.writes[:-1], commands[:-1])
+        self.assertEqual(self.link.device.writes[-1], "#UNKNOWN")
+
+    def test_terminal_rejects_only_multiline_or_non_ascii_input(self):
+        for command in ["", "   ", "#GETJPOS\n!STOP", "#GETJPOS\r\n", "速度"]:
             with self.subTest(command=command), self.assertRaises(ValueError):
                 self.link.send_user_command(command)
         self.assertEqual(self.link.device.writes, [])
 
     def test_new_gripper_extensions_and_tuning_mode(self):
-        self.assertEqual(self.link.send_user_command(">0,-75,180,0,0,0,30,40,0.5")["reply"], "15")
+        self.assertEqual(self.link.send_user_command(">0,-75,180,0,0,0,30,40,0.5")["reply"], "ok")
         self.assertEqual(self.link.send_user_command("#CMDMODE 4")["reply"], "Set command mode to [4]")
 
     def test_errors_and_legacy_queue_full_are_never_success(self):
@@ -103,7 +127,7 @@ class ProtocolTests(unittest.TestCase):
         self.link.faults = [8] * 6
         device = self.link.device
         device.responses["#GETCAN"] = ["okc 1200 1201 0 0 0 0"]
-        device.responses["#GETDRV 2"] = ["okd 1 20 1 0 8 251 100", "okd 2 10 1 0 8 251 105"]
+        device.responses["#GETDRV 2"] = ["okd 2 10 1 0 8 251 105"]
         self.assertEqual(self.link.send_user_command("#GETCAN")["reply"], "okc 1200 1201 0 0 0 0")
         self.assertEqual(self.link.send_user_command("#GETDRV 2")["reply"], "okd 2 10 1 0 8 251 105")
         self.assertEqual(device.writes, ["#GETCAN", "#GETDRV 2"])
@@ -113,8 +137,9 @@ class ProtocolTests(unittest.TestCase):
         self.link.faults = [0,128,0,0,0,0]
         self.assertEqual(self.link.fault_message(), "J2: F1控制循环超时")
         for command in ["#GETTIMING 0", "#GETTIMING 7", "#GETDRV 0", "#GETDRV 7", "#GETDRV 2 extra"]:
-            with self.assertRaises(ValueError):
-                self.link.send_user_command(command)
+            self.link.send_user_command(command)
+        self.assertEqual(device.writes[-5:], ["#GETTIMING 0", "#GETTIMING 7", "#GETDRV 0",
+                                              "#GETDRV 7", "#GETDRV 2 extra"])
 
     def test_joined_ack_is_not_guessed_or_replayed(self):
         device = self.link.device
@@ -135,6 +160,15 @@ class ProtocolTests(unittest.TestCase):
         status = self.link.status()
         self.assertFalse(status["enabled"])
         self.assertIn("固件拒绝", status["error"])
+
+    def test_status_handshake_accepts_drag_mode_five(self):
+        device = FakeSerial()
+        device.responses["#GETSTATUS"] = ["oks 1 5 0 0 0 0 0 0 0"]
+        with patch.object(server.serial, "Serial", return_value=device), patch.object(server.time, "sleep"):
+            result = self.link.connect({"port": "/dev/test"})
+        self.assertTrue(result["connected"])
+        self.assertEqual(self.link.command_mode, 5)
+        self.assertTrue(self.link.enabled)
 
     def test_connect_requires_firmware_handshake_and_allows_fault_diagnosis(self):
         device = FakeSerial()

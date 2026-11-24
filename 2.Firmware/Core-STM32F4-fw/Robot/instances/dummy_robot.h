@@ -4,6 +4,7 @@
 #include <string>
 
 #include "algorithms/kinematic/6dof_kinematic.h"
+#include "algorithms/gravity_compensation/gravity_compensation.hpp"
 #include "actuators/ctrl_step/ctrl_step.hpp"
 
 #define ALL 0
@@ -70,7 +71,8 @@ public:
         COMMAND_TARGET_POINT_SEQUENTIAL = 1,
         COMMAND_TARGET_POINT_INTERRUPTABLE,
         COMMAND_CONTINUES_TRAJECTORY,
-        COMMAND_MOTOR_TUNING
+        COMMAND_MOTOR_TUNING,
+        COMMAND_DRAG = 5
     };
 
 
@@ -125,6 +127,7 @@ public:
     CommandMode commandMode = DEFAULT_COMMAND_MODE;
     CtrlStepMotor* motorJ[7] = {nullptr};
     DummyHand* hand = {nullptr};
+    GravityCompensation::Model gravityModel;
 
 
     void Init();
@@ -144,12 +147,20 @@ public:
     bool IsMoving();
     bool IsEnabled();
     void SetCommandMode(uint32_t _mode);
+    void UpdateGravityFeedForward(uint32_t tick);
+    void DragTick(uint32_t tick);
+    void SetGravityFeedForwardEnabled(bool _enabled) { gravityFeedForwardEnabled = _enabled; }
+    bool IsGravityFeedForwardEnabled() const { return gravityFeedForwardEnabled; }
+    void SetDragGains(float _damping, float _frictionAlpha, float _currentLimit);
+    void GetDragGains(float* _gains) const;
     void CheckSafety();
     bool ClearFaults();
     bool HasFault() const;
     uint8_t GetFaultJointMask() const;
     uint8_t GetJointFault(unsigned joint) const { return jointFaults[joint]; }
     uint32_t GetFaultFeedbackAge(unsigned joint) const { return faultFeedbackAge[joint]; }
+    uint16_t GetFeedForwardSequence() const { return feedForwardSequence; }
+    uint16_t GetDragSequence() const { return dragSequence; }
     void StopMotion();
     bool WaitForMotion(uint32_t timeoutMs = 0);
     bool IsHolding() const { return holdOnStop; }
@@ -230,6 +241,13 @@ private:
     uint32_t safetyStarted = 0;
     uint32_t motionTimeoutMs = 30000;
     uint32_t enabledAt = 0;
+    bool gravityFeedForwardEnabled = false;
+    uint16_t feedForwardSequence = 0;
+    uint16_t dragSequence = 0;
+    float dragDamping = 0.0f;
+    float dragFrictionAlpha = 0.0f;
+    float dragCurrentLimit = 1.0f;
+    float dragVelocityFiltered[7]{};
 };
 
 

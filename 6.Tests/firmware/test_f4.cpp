@@ -159,6 +159,45 @@ int main() {
     ascii(">nan,-75,180,0,0,0", uart, true); assert(uart.output.find("error") == 0);
     ascii("#CMDMODE 4", usb); assert(dummy.commandMode == DummyRobot::COMMAND_MOTOR_TUNING);
     ascii(">0,-75,180,0,0,0", usb); assert(usb.output.find("error") == 0);
+
+    // Drag mode emits leased current commands, never a stale position target.
+    ascii("#CMDMODE 5", usb); assert(dummy.commandMode == DummyRobot::COMMAND_DRAG);
+    ascii("#GETDRAG", usb); assert(usb.output.find("okg 5 0 0.000 0.000 1.000") == 0);
+    ascii("#DRAG_GAIN 0.01 0.25 1.0", usb);
+    assert(usb.output.find("Drag gains") == 0);
+    ascii("#DRAG_GAIN nan 0.25 1.0", usb); assert(usb.output.find("error") == 0);
+    frames.clear(); dummy.DragTick(1);
+    assert(frames.size() == 6);
+    for (const auto& frame : frames)
+        assert(frame.header.StdId == ((frame.header.StdId >> 7) << 7 | 0x0B) &&
+               std::isfinite(value(frame, 0)) && std::isfinite(value(frame, 4)));
+    // REST pose must also be compensated: J2 motor negative, J3 motor positive.
+    assert(value(frames[1], 0) < -0.1f && value(frames[2], 0) > 0.1f);
+    frames.clear(); dummy.DragTick(20);
+    unsigned dragFrames = 0, feedbackRequests = 0;
+    for (const auto& frame : frames)
+    {
+        const unsigned cmd = frame.header.StdId & 0x7f;
+        if (cmd == 0x0B) ++dragFrames;
+        if (cmd == 0x22 || cmd == 0x23) ++feedbackRequests;
+        assert(cmd != 0x07);
+    }
+    assert(dragFrames == 6 && feedbackRequests == 12);
+    ascii("#GETDRAG", usb); assert(usb.output.find("okg 5 0 ") == 0);
+
+    // Gravity feed-forward follows the calibrated URDF model and motor sign.
+    for (unsigned j = 1; j <= 6; ++j) dummy.currentJoints.a[j - 1] = 0;
+    dummy.currentJoints.a[1] = 0;
+    dummy.currentJoints.a[2] = 90;
+    ascii("#GRAVITY_FF_ON", usb);
+    frames.clear(); dummy.UpdateGravityFeedForward(4);
+    assert(frames.size() == 6);
+    for (const auto& frame : frames) assert((frame.header.StdId & 0x7f) == 0x0A);
+    assert(value(frames[1], 0) > 0 && value(frames[2], 0) > 0);
+    ascii("#GRAVITY_FF_OFF", usb);
+    frames.clear(); dummy.UpdateGravityFeedForward(8);
+    assert(frames.size() == 6);
+    for (const auto& frame : frames) assert(value(frame, 0) == 0);
     dummy.SetCommandMode(2);
 
     // Wrong node, short, remote, extended and NaN feedback must not index/refresh a joint.

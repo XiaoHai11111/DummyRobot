@@ -114,13 +114,46 @@ static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
     {
         unsigned long mode;
         char extra;
-        if (sscanf(cmd, "#CMDMODE %lu %c", &mode, &extra) != 1 || mode < 1 || mode > 4)
-            Respond(response, "error invalid mode (1=SEQ 2=INT 3=TRJ 4=TUN)");
+        if (sscanf(cmd, "#CMDMODE %lu %c", &mode, &extra) != 1 || mode < 1 || mode > 5)
+            Respond(response, "error invalid mode (1=SEQ 2=INT 3=TRJ 4=TUN 5=DRAG)");
         else
         {
             dummy.SetCommandMode(mode);
             Respond(response, "Set command mode to [%lu]", mode);
         }
+    } else if (text == "#GRAVITY_FF_ON")
+    {
+        dummy.SetGravityFeedForwardEnabled(true);
+        Respond(response, "Gravity feed-forward enabled, review required");
+    } else if (text == "#GRAVITY_FF_OFF")
+    {
+        dummy.SetGravityFeedForwardEnabled(false);
+        Respond(response, "Gravity feed-forward disabled");
+    } else if (text.rfind("#DRAG_GAIN ", 0) == 0)
+    {
+        float damping, frictionAlpha, currentLimit;
+        char extra;
+        if (sscanf(cmd, "#DRAG_GAIN %f %f %f %c", &damping, &frictionAlpha,
+                   &currentLimit, &extra) != 3 ||
+            !MotionFinite(damping) || !MotionFinite(frictionAlpha) ||
+            !MotionFinite(currentLimit) || damping < 0 || damping > 0.2f ||
+            frictionAlpha < 0 || frictionAlpha > 1 ||
+            currentLimit < 0.1f || currentLimit > 1.5f)
+            Respond(response, "error invalid drag gains");
+        else
+        {
+            dummy.SetDragGains(damping, frictionAlpha, currentLimit);
+            Respond(response, "Drag gains %.3f %.3f %.3f", damping, frictionAlpha, currentLimit);
+        }
+    } else if (text == "#GETDRAG")
+    {
+        float gains[3];
+        dummy.GetDragGains(gains);
+        Respond(response, "okg %lu %d %.3f %.3f %.3f %u %u",
+                static_cast<unsigned long>(dummy.commandMode),
+                dummy.IsGravityFeedForwardEnabled() ? 1 : 0,
+                gains[0], gains[1], gains[2],
+                dummy.GetFeedForwardSequence(), dummy.GetDragSequence());
     } else if (text.rfind("#GRIP", 0) == 0)
     {
         float value;

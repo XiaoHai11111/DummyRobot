@@ -23,7 +23,7 @@ static uint32_t controlBudgetCycles;
 void Main()
 {
     uint64_t serialNum = GetSerialNumber();
-    uint16_t defaultNodeID = 1;
+    uint16_t defaultNodeID = 6;
 
     /*---------- Apply EEPROM Settings ----------*/
     // Setting priority is EEPROM > Motor.h
@@ -51,6 +51,8 @@ void Main()
     }
     motor.config.motionParams.encoderHomeOffset = boardConfig.encoderHomeOffset;
     motor.config.motionParams.ratedCurrent = boardConfig.currentLimit;
+    motor.config.ctrlParams.feedForward.maxCurrent = boardConfig.currentLimit;
+    motor.config.ctrlParams.feedForward.dragCurrentAcc = 20 * 1000;
     motor.config.motionParams.ratedVelocity = boardConfig.velocityLimit;
     motor.config.motionParams.ratedVelocityAcc = boardConfig.velocityAcc;
     motor.motionPlanner.velocityTracker.SetVelocityAcc(boardConfig.velocityAcc);

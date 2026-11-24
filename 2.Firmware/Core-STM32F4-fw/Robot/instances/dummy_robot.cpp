@@ -472,9 +472,10 @@ bool DummyRobot::IsEnabled()
 void DummyRobot::SetCommandMode(uint32_t _mode)
 {
     if (_mode < COMMAND_TARGET_POINT_SEQUENTIAL ||
-        _mode > COMMAND_MOTOR_TUNING)
+        _mode > COMMAND_DRAG)
         return;
 
+    const bool leavingDrag = commandMode == COMMAND_DRAG && _mode != COMMAND_DRAG;
     commandHandler.ClearFifo();
     commandMode = static_cast<CommandMode>(_mode);
 
@@ -491,6 +492,103 @@ void DummyRobot::SetCommandMode(uint32_t _mode)
             break;
         case COMMAND_MOTOR_TUNING:
             break;
+        case COMMAND_DRAG:
+            for (float& velocity : dragVelocityFiltered) velocity = 0;
+            break;
+    }
+    if (leavingDrag) motorJ[ALL]->Hold();
+}
+
+
+static uint16_t NextSequence(uint16_t& sequence)
+{
+    ++sequence;
+    if (sequence == 0) sequence = 1;
+    return sequence;
+}
+
+
+void DummyRobot::SetDragGains(float _damping, float _frictionAlpha, float _currentLimit)
+{
+    if (!std::isfinite(_damping) || !std::isfinite(_frictionAlpha) ||
+        !std::isfinite(_currentLimit) ||
+        _damping < 0 || _damping > 0.2f ||
+        _frictionAlpha < 0 || _frictionAlpha > 1 ||
+        _currentLimit < 0.1f || _currentLimit > 1.5f)
+        return;
+    dragDamping = _damping;
+    dragFrictionAlpha = _frictionAlpha;
+    dragCurrentLimit = _currentLimit;
+}
+
+
+void DummyRobot::GetDragGains(float* _gains) const
+{
+    _gains[0] = dragDamping;
+    _gains[1] = dragFrictionAlpha;
+    _gains[2] = dragCurrentLimit;
+}
+
+
+void DummyRobot::UpdateGravityFeedForward(uint32_t tick)
+{
+    if (tick % 4) return; // 50 Hz from the 200 Hz control task.
+    const uint16_t sequence = NextSequence(feedForwardSequence);
+    float gravityCurrentA[7]{};
+    if (gravityFeedForwardEnabled && IsEnabled() && !HasFault())
+        gravityModel.CalculateGravityCurrentA(currentJoints.a, gravityCurrentA);
+    for (unsigned j = 1; j <= 6; ++j)
+    {
+        const float jointCurrentA = gravityCurrentA[j];
+        const float motorCurrentA = motorJ[j]->inverseDirection ? -jointCurrentA : jointCurrentA;
+        motorJ[j]->SetCurrentFeedForward(motorCurrentA, sequence, 100);
+    }
+}
+
+
+void DummyRobot::DragTick(uint32_t tick)
+{
+    if (!IsEnabled() || HasFault())
+    {
+        motorJ[ALL]->Hold();
+        return;
+    }
+    if (tick % 20 == 0)
+    {
+        for (unsigned j = 1; j <= 6; ++j)
+        {
+            motorJ[j]->RequestPositionFeedback();
+            motorJ[j]->RequestVelocityFeedback();
+        }
+    }
+
+    const uint16_t sequence = NextSequence(dragSequence);
+    float gravityCurrentA[7]{};
+    gravityModel.CalculateGravityCurrentA(currentJoints.a, gravityCurrentA);
+    for (unsigned j = 1; j <= 6; ++j)
+    {
+        const float measuredVelocity = motorJ[j]->VelocityAge() < 250 ?
+                                       motorJ[j]->GetVelocityDegS() : 0;
+        dragVelocityFiltered[j] += 0.2f * (measuredVelocity - dragVelocityFiltered[j]);
+        const float velocity = dragVelocityFiltered[j];
+        float jointCurrentA = gravityCurrentA[j];
+        const float loss = gravityModel.FrictionLossA(j, velocity);
+        const float smoothSign = velocity / (fabsf(velocity) + 2.0f);
+        jointCurrentA += dragFrictionAlpha * smoothSign * loss - dragDamping * velocity;
+
+        const float q = currentJoints.a[j - 1];
+        const float maxAngle = motorJ[j]->angleLimitMax;
+        const float minAngle = motorJ[j]->angleLimitMin;
+        if (q >= maxAngle - 2 && jointCurrentA > 0) jointCurrentA = 0;
+        if (q <= minAngle + 2 && jointCurrentA < 0) jointCurrentA = 0;
+        if (fabsf(velocity) > 30 &&
+            ((velocity > 0 && jointCurrentA > 0) || (velocity < 0 && jointCurrentA < 0)))
+            jointCurrentA = 0;
+
+        jointCurrentA = GravityCompensation::Model::Clamp(jointCurrentA, dragCurrentLimit);
+        const float motorCurrentA = motorJ[j]->inverseDirection ?
+                                    -jointCurrentA : jointCurrentA;
+        motorJ[j]->SetDragCurrent(motorCurrentA, sequence, 200);
     }
 }
 

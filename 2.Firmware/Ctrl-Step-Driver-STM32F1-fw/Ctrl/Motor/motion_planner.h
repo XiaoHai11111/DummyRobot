@@ -11,6 +11,7 @@ public:
 
     const int32_t CONTROL_FREQUENCY = 20000;                    // Hz
     const int32_t  CONTROL_PERIOD = 1000000 / CONTROL_FREQUENCY; // uS
+    const int32_t CONTROL_TICKS_PER_MS = CONTROL_FREQUENCY / 1000;
 
     struct Config_t
     {

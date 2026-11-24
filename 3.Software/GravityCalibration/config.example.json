@@ -1,17 +1,23 @@
 {
-  "pose_id": "P0",
-  "joint": 1,
-  "fixed_pose_deg": [0, 0, 90, 0, 0, 0],
-  "sweep_min_deg": -155,
-  "sweep_max_deg": 155,
+  "pose_id": "P3_J3",
+  "joint": 3,
+  "fixed_pose_deg": [
+    21.813,
+    -12.15,
+    62.358,
+    1.731,
+    1.177,
+    1.449
+  ],
+  "sweep_min_deg": 40,
+  "sweep_max_deg": 165,
   "speed_deg_s": 1.0,
   "cycles": 5,
   "sample_hz": 20,
   "endpoint_hold_s": 1.0,
   "current_limit_a": 3.0,
-  "payload_description": "gripper, camera",
-  "temperature_note": "0s",
+  "payload_description": "gripper, camera mounted, camera data cable unplugged, combined pose P3",
+  "temperature_note": "combined pose P3",
   "firmware_revision": "v0.0.0.3",
   "operator_reviewed_workspace": true
 }
-

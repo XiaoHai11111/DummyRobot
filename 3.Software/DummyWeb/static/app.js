@@ -63,17 +63,18 @@ function appendCommandHistory(command, reply, kind = '') {
 }
 
 function commandNeedsConfirmation(command) {
-  return /^[>@]/.test(command)
-    || /^!START$/.test(command)
-    || /^#GRIP(?:\s|_CURRENT\s)/.test(command)
-    || /^#CMDMODE\s/.test(command)
-    || command === '!CLEARFAULT';
+  const normalized = command.trim();
+  return /^[>@]/.test(normalized)
+    || /^!START$/.test(normalized)
+    || /^#GRIP(?:\s|_CURRENT\s)/.test(normalized)
+    || /^#CMDMODE\s/.test(normalized)
+    || normalized === '!CLEARFAULT';
 }
 
 async function sendAsciiCommand() {
   const input = $('asciiCommand');
-  const command = input.value.trim();
-  if (!command || !app.robot.connected || app.commandBusy) return;
+  const command = input.value;
+  if (!command.trim() || !app.robot.connected || app.commandBusy) return;
   if (commandNeedsConfirmation(command)
       && !window.confirm(`即将发送机械臂指令：\n${command}\n\n请确认机械臂周围安全，是否继续？`)) return;
 

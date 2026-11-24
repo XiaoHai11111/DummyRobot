@@ -22,6 +22,13 @@ struct Encoder : EncoderBase {
     uint16_t UpdateAngle() override { return 0; }
     bool IsCalibrated() override { return calibrated; }
 } encoder;
+struct Driver : DriverBase {
+    void Init() override {}
+    void SetFocCurrentVector(uint32_t, int32_t) override {}
+    void Sleep() override {}
+    void Brake() override {}
+    void SetTwoCoilsCurrent(uint16_t, uint16_t) override {}
+} driver;
 int main() {
     // Boot inquiry before encoder attachment is valid, and reports not calibrated.
     uint8_t data[8]{};
@@ -29,6 +36,7 @@ int main() {
     OnCanCmd(0x23, data, 0);
     assert(lastId == (2U << 7 | 0x23) && reply[6] == 4 && reply[7] == 0xA1);
     motor.AttachEncoder(&encoder);
+    motor.AttachDriver(&driver);
     boardConfig.velocityLimit = 2 * motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;
     for (uint8_t cmd : {1,3,4,5,6,7,0x11,0x12,0x13,0x14,0x1B}) {
         const auto count = replies;
@@ -58,5 +66,32 @@ int main() {
     OnCanCmd(0x23, data, 8); assert(reply[6] == 2 && reply[7] == 0xA1);
     encoder.calibrated = false;
     OnCanCmd(0x23, data, 8); assert(reply[6] == 6);
-    std::cout << "F1 CAN status and malformed request tests passed\n";
+    encoder.calibrated = true;
+    motor.controller->Init();
+    motor.controller->SetCtrlMode(Motor::MODE_STOP);
+    motor.Tick20kHz(); // Consume the one-time first-call encoder initialization.
+
+    float ff = 0.4f;
+    uint16_t ffSeq = 1, lease = 100;
+    memcpy(data, &ff, 4);
+    memcpy(data + 4, &ffSeq, 2);
+    memcpy(data + 6, &lease, 2);
+    const auto before = replies;
+    OnCanCmd(0x0A, data, 4); assert(replies == before);
+    OnCanCmd(0x0A, data, 8); assert(replies == before);
+    motor.Tick20kHz();
+    assert(motor.controller->GetFeedForwardSequence() == 1);
+    assert(motor.controller->GetFeedForwardCurrent_mA() == 400);
+    assert(motor.controller->modeRunning == Motor::MODE_STOP);
+    ffSeq = 1; memcpy(data + 4, &ffSeq, 2);
+    motor.Tick20kHz();
+    assert(motor.controller->GetFeedForwardSequence() == 1);
+    ff = std::numeric_limits<float>::quiet_NaN();
+    memcpy(data, &ff, 4);
+    OnCanCmd(0x0B, data, 8);
+    motor.Tick20kHz();
+    assert(motor.controller->GetDragSequence() == 0);
+    OnCanCmd(0x26, data, 0);
+    assert(lastId == ((2U << 7) | 0x26) && reply[7] == 0xA2);
+    std::cout << "F1 CAN status, feed-forward and malformed request tests passed\n";
 }

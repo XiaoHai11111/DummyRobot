@@ -125,5 +125,46 @@ int main() {
     encoder.calibrated = false;
     motor.controller->ClearStallFlag(); ticks(motor, 3);
     assert(motor.controller->GetFaultFlags() == 4); // Clearing cannot create calibration.
-    std::cout << "F1 controller fault, hold, recovery and anti-windup tests passed\n";
+    // RAM-only feed-forward rejects bad packets and expires without a refresh.
+    Motor ffMotor;
+    Driver ffDriver;
+    encoder.angleData.rectifiedAngle = 0;
+    ffMotor.AttachEncoder(&encoder);
+    ffMotor.AttachDriver(&ffDriver);
+    ffMotor.controller->Init();
+    encoder.calibrated = true;
+    ffMotor.config.motionParams.ratedCurrent = 3000;
+    ffMotor.config.ctrlParams.dce.kp = 1000;
+    ffMotor.Tick20kHz();
+    ffMotor.controller->SetEnable(true); ticks(ffMotor, 3);
+    ffMotor.controller->SetCtrlMode(Motor::MODE_COMMAND_POSITION);
+    ffMotor.controller->SetPositionSetPoint(0);
+    assert(ffMotor.controller->RequestCurrentFeedForward(0.5f, 1, 100));
+    assert(!ffMotor.controller->RequestCurrentFeedForward(0.5f, 1, 100));
+    assert(!ffMotor.controller->RequestCurrentFeedForward(0.5f, 2, 0));
+    ffMotor.Tick20kHz();
+    assert(ffMotor.controller->GetFeedForwardSequence() == 1);
+    assert(ffMotor.controller->GetFeedForwardCurrent_mA() == 500);
+    assert(ffDriver.current == 500);
+    ticks(ffMotor, 2000);
+    assert(ffMotor.controller->GetFeedForwardCurrent_mA() == 0);
+    assert(ffDriver.current == 0);
+
+    // Drag current is leased; expiry returns to position hold.
+    assert(ffMotor.controller->RequestDragCurrent(0.3f, 1, 500));
+    ticks(ffMotor, 4000); // Current mode switch and 2 mA/ms current ramp.
+    assert(ffMotor.controller->modeRunning == Motor::MODE_COMMAND_CURRENT);
+    assert(ffDriver.current == 300);
+    ticks(ffMotor, 10000);
+    ticks(ffMotor, 3);
+    assert(ffMotor.controller->modeRunning == Motor::MODE_COMMAND_POSITION);
+    assert(ffDriver.current == 0);
+
+    // A later fresh drag request must work without re-enabling the motor.
+    assert(ffMotor.controller->RequestDragCurrent(0.3f, 2, 500));
+    ticks(ffMotor, 4000);
+    assert(ffMotor.controller->modeRunning == Motor::MODE_COMMAND_CURRENT);
+    assert(ffDriver.current == 300);
+
+    std::cout << "F1 controller fault, hold, feed-forward and drag tests passed\n";
 }

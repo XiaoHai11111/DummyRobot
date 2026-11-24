@@ -42,6 +42,10 @@ public:
     bool SetEnable(bool _enable);
     void DoCalibration();
     void SetCurrentSetPoint(float _val);
+    void SetCurrentFeedForward(float _val, uint16_t _seq, uint16_t _leaseMs);
+    void SetDragCurrent(float _val, uint16_t _seq, uint16_t _leaseMs);
+    void RequestVelocityFeedback();
+    void RequestPositionFeedback();
     void SetVelocitySetPoint(float _val);
     void SetPositionSetPoint(float _val);
     void SetPositionWithVelocityLimit(float _pos, float _vel);
@@ -63,6 +67,17 @@ public:
     void UpdateAngleCallback(float _pos, bool _isFinished);
     void UpdateStatus(uint8_t _state, uint8_t _faults, bool _supported);
     uint32_t FeedbackAge() const;
+    uint32_t VelocityAge() const
+    {
+        const uint32_t receivedAt = velocityTick;
+        return HAL_GetTick() - receivedAt;
+    }
+    float GetVelocityDegS() const
+    {
+        const float turnsPerSecond = velocityTurnsPerSecond;
+        const float deg = turnsPerSecond * 360.0f / static_cast<float>(reduction);
+        return inverseDirection ? -deg : deg;
+    }
     bool ClearFaults();
     bool ReadControlTiming();
     void UpdateControlTiming(uint16_t last, uint16_t peak, uint32_t overruns);

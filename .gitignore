@@ -43,3 +43,6 @@ Thumbs.db
 desktop.ini
 
 4.Model/
+
+.codebuddy/
+.playwright-cli/

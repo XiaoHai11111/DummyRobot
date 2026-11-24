@@ -1,6 +1,7 @@
 #include "common_inc.h"
 #include "configurations.h"
 #include <can.h>
+#include <cmath>
 #include <cstring>
 #include "Motor/control_timing.h"
 
@@ -54,13 +55,17 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
 
     // Reject short frames before touching payload; inquiries/hold/clear have no arguments.
     if (((_cmd >= 0x01 && _cmd <= 0x07 && _cmd != 0x02) && _len < 4) ||
-        ((_cmd == 0x06 || _cmd == 0x07) && _len < 8) ||
+        ((_cmd == 0x06 || _cmd == 0x07 || _cmd == 0x0A || _cmd == 0x0B) && _len < 8) ||
         ((_cmd >= 0x11 && _cmd <= 0x1B) && _len < 5))
         return;
-    if ((_cmd >= 0x03 && _cmd <= 0x07) || (_cmd >= 0x12 && _cmd <= 0x14))
+    if ((_cmd >= 0x03 && _cmd <= 0x07) || _cmd == 0x0A || _cmd == 0x0B ||
+        (_cmd >= 0x12 && _cmd <= 0x14))
     {
         memcpy(&tmpF, _data, sizeof(tmpF));
         if (!FiniteFloat(tmpF) || tmpF < -40000.0f || tmpF > 40000.0f)
+            return;
+        if ((_cmd == 0x0A || _cmd == 0x0B) &&
+            fabsf(tmpF) * 1000.0f > motor.config.ctrlParams.feedForward.maxCurrent)
             return;
         if ((_cmd == 0x12 && (tmpF <= 0 || tmpF > 3.3f)) ||
             ((_cmd == 0x13 || _cmd == 0x14) && tmpF <= 0))
@@ -143,6 +148,16 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             break;
         case 0x09: // Hold the measured position (does not clear a fault).
             motor.controller->RequestHold();
+            break;
+        case 0x0A: // Set RAM-only current feed-forward, no mode switch.
+            motor.controller->RequestCurrentFeedForward(
+                ReadValue<float>(_data), ReadValue<uint16_t>(_data + 4),
+                ReadValue<uint16_t>(_data + 6));
+            break;
+        case 0x0B: // Set leased drag current and enter current mode.
+            motor.controller->RequestDragCurrent(
+                ReadValue<float>(_data), ReadValue<uint16_t>(_data + 4),
+                ReadValue<uint16_t>(_data + 6));
             break;
 
             // 0x10~0x1F CMDs with Memory
@@ -250,6 +265,28 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             memcpy(reply + 2, &peak16, 2);
             memcpy(reply + 4, &overruns, 4);
             txHeader.StdId = (boardConfig.canNodeId << 7) | 0x25;
+            CAN_Send(&txHeader, reply);
+        }
+            break;
+
+        case 0x26: // Read-only feed-forward diagnostics.
+        {
+            uint8_t reply[8] = {};
+            const int16_t feedback = static_cast<int16_t>(
+                motor.controller->GetFeedbackCurrent_mA());
+            const int16_t feedForward = static_cast<int16_t>(
+                motor.controller->GetFeedForwardCurrent_mA());
+            const int16_t total = static_cast<int16_t>(
+                motor.controller->GetTotalCurrent_mA());
+            uint8_t flags = 0;
+            if (motor.controller->IsFeedForwardLimited()) flags |= 1;
+            if (motor.controller->GetFeedForwardCurrent_mA() != 0) flags |= 2;
+            memcpy(reply, &feedback, 2);
+            memcpy(reply + 2, &feedForward, 2);
+            memcpy(reply + 4, &total, 2);
+            reply[6] = flags;
+            reply[7] = 0xA2;
+            txHeader.StdId = (boardConfig.canNodeId << 7) | 0x26;
             CAN_Send(&txHeader, reply);
         }
             break;

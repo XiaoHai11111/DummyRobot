@@ -49,18 +49,18 @@
             <div><span class="eyebrow">02 / ASCII TERMINAL</span><h2>串口指令</h2></div>
             <span class="camera-tag">USB CDC</span>
           </div>
-          <label class="command-label" for="asciiCommand">输入一条固件指令</label>
+          <label class="command-label" for="asciiCommand">输入一条 ASCII 指令（原样发送）</label>
           <div class="command-input-row">
-            <input id="asciiCommand" class="command-input" type="text" maxlength="128"
-                   placeholder="#GETJPOS" autocomplete="off" spellcheck="false" disabled />
+            <input id="asciiCommand" class="command-input" type="text"
+                   placeholder="#GETJPOS 或任意固件指令" autocomplete="off" spellcheck="false" disabled />
             <button class="button button-primary command-send" id="sendAsciiCommand" disabled>发送</button>
           </div>
           <button class="button button-outline button-wide" id="clearFaults" disabled>清除故障（驱动失能）</button>
-          <div class="command-hint">例如 #GETJPOS · 回车发送 · 运动指令要求已使能</div>
+          <div class="command-hint">回车发送 · 不校验指令类型/速度/参数，由固件自行判断</div>
           <div class="command-history" id="commandHistory" aria-live="polite">
-            <div class="command-placeholder">等待指令；支持列表见 README</div>
+            <div class="command-placeholder">等待指令；发送内容与回包原样显示</div>
           </div>
-          <div class="command-safety">运动、夹爪和使能指令会二次确认；STOP 可直接发送。</div>
+          <div class="command-safety">运动、夹爪和使能指令会二次确认；未知指令也会直接发送。</div>
         </section>
 
         <section class="panel camera-panel">

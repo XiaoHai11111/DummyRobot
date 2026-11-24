@@ -17,10 +17,12 @@ DummyRobot dummy(&hcan1);
 osThreadId_t controlLoopFixUpdateHandle;
 void ThreadControlLoopFixUpdate(void* argument)
 {
+    uint32_t controlTick = 0;
     for (;;)
     {
         // Suspended here until got Notification.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ++controlTick;
 
         dummy.CheckSafety();
         if (dummy.IsEnabled())
@@ -32,11 +34,16 @@ void ThreadControlLoopFixUpdate(void* argument)
                 case DummyRobot::COMMAND_TARGET_POINT_INTERRUPTABLE:
                 case DummyRobot::COMMAND_CONTINUES_TRAJECTORY:
                     dummy.MoveJoints(dummy.targetJoints);
+                    dummy.UpdateGravityFeedForward(controlTick);
                     //dummy.UpdateJointAngles();
                     dummy.UpdateJointPose6D();
                     break;
                 case DummyRobot::COMMAND_MOTOR_TUNING:
                     dummy.tuningHelper.Tick(10);
+                    dummy.UpdateJointPose6D();
+                    break;
+                case DummyRobot::COMMAND_DRAG:
+                    dummy.DragTick(controlTick);
                     dummy.UpdateJointPose6D();
                     break;
             }
@@ -71,7 +78,7 @@ void ThreadOledUpdate(void* argument)
 {
     uint32_t t = micros();
     char buf[16];
-    char cmdModeNames[4][4] = {"SEQ", "INT", "TRJ", "TUN"};
+    char cmdModeNames[5][4] = {"SEQ", "INT", "TRJ", "TUN", "DRG"};
 
     for (;;)
     {

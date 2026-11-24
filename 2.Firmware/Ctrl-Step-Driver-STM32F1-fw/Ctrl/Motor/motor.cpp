@@ -3,6 +3,13 @@
 #include "control_math.h"
 
 #include <cmath>
+#include <cstring>
+
+
+bool Motor::Controller::IsNewerSequence(uint16_t sequence, uint16_t last)
+{
+    return sequence != 0 && static_cast<int16_t>(sequence - last) > 0;
+}
 
 
 void Motor::Tick20kHz()
@@ -98,6 +105,7 @@ void Motor::CloseLoopControlTick()
         const bool clear = controller->clearFaultsRequested;
         controller->clearFaultsRequested = false;
         controller->holdRequested = false;
+        controller->ClearFeedForward();
         controller->goalPosition = controller->realPosition;
         controller->softPosition = controller->realPosition;
         controller->goalVelocity = controller->softVelocity = 0;
@@ -116,18 +124,23 @@ void Motor::CloseLoopControlTick()
         }
     }
 
+    controller->ConsumeFeedForwardRequest();
+    controller->UpdateFeedForwardLease();
+
     /************************************ Ctrl Loop ************************************/
     if (controller->isStalled ||
         controller->softDisable ||
         !encoder->IsCalibrated())
     {
         controller->ClearIntegral();    // clear integrals
+        controller->ClearFeedForward();
         controller->focPosition = 0;    // clear outputs
         controller->focCurrent = 0;
         driver->Sleep();
     } else if (controller->softBrake)
     {
         controller->ClearIntegral();
+        controller->ClearFeedForward();
         controller->focPosition = 0;
         controller->focCurrent = 0;
         driver->Brake();
@@ -417,17 +430,27 @@ void Motor::Controller::CalcDceToOutput(int32_t _location, int32_t _speed)
     config->dce.outputKp = config->dce.kp * config->dce.pError;
 
     config->dce.outputKd = config->dce.kd * config->dce.vError;
+    const int64_t ff = static_cast<int64_t>(feedForwardActive ? feedForwardCurrent_mA : 0) * 1024;
+    const int64_t proportionalDerivative =
+        static_cast<int64_t>(config->dce.outputKp) + config->dce.outputKd + ff;
     IntegrateLimited<128>(config->dce.outputKi, config->dce.integralRound,
                      static_cast<int64_t>(config->dce.ki) * config->dce.pError +
                      static_cast<int64_t>(config->dce.kv) * config->dce.vError,
-                     static_cast<int64_t>(config->dce.outputKp) + config->dce.outputKd,
+                     proportionalDerivative,
                      context->config.motionParams.ratedCurrent);
 
-    config->dce.output = (config->dce.outputKp + config->dce.outputKi + config->dce.outputKd) >> 10;
-    if (config->dce.output > context->config.motionParams.ratedCurrent)
-        config->dce.output = context->config.motionParams.ratedCurrent;
-    else if (config->dce.output < -context->config.motionParams.ratedCurrent)
-        config->dce.output = -context->config.motionParams.ratedCurrent;
+    const int64_t rawFeedback = static_cast<int64_t>(config->dce.outputKp) +
+                                config->dce.outputKi + config->dce.outputKd;
+    const int64_t rawTotal = rawFeedback + ff;
+    const int32_t limit = context->config.motionParams.ratedCurrent;
+    feedbackCurrent_mA = static_cast<int32_t>(rawFeedback >> 10);
+    feedForwardLimited = rawTotal > static_cast<int64_t>(limit) * 1024 ||
+                         rawTotal < -static_cast<int64_t>(limit) * 1024;
+    int64_t total = rawTotal >> 10;
+    if (total > limit) total = limit;
+    else if (total < -limit) total = -limit;
+    config->dce.output = static_cast<int32_t>(total);
+    totalCurrent_mA = config->dce.output;
 
     CalcCurrentToOutput(config->dce.output);
 }
@@ -442,6 +465,10 @@ void Motor::Controller::SetCtrlMode(Motor::Mode_t _mode)
         holdRequested = false;
         motionBlocked = true;
     }
+    if (_mode != MODE_COMMAND_POSITION && _mode != MODE_COMMAND_Trajectory)
+        ClearFeedForward();
+    if (_mode != MODE_COMMAND_CURRENT)
+        RestoreCurrentAcceleration();
     requestMode = _mode;
 }
 
@@ -534,6 +561,145 @@ void Motor::Controller::SetCurrentSetPoint(int32_t _cur)
 }
 
 
+bool Motor::Controller::RequestCurrentFeedForward(float _amps, uint16_t _seq, uint16_t _leaseMs)
+{
+    if (!config || !std::isfinite(_amps) ||
+        fabsf(_amps) * 1000.0f > config->feedForward.maxCurrent ||
+        _leaseMs < config->feedForward.minLeaseMs ||
+        _leaseMs > config->feedForward.maxLeaseMs ||
+        _seq == ffRequestSeq ||
+        !IsNewerSequence(_seq, lastFeedForwardSequence))
+        return false;
+
+    ffRequestWriteSeq++; // Odd: request is being written.
+    ffRequestCurrent_mA = static_cast<int32_t>(_amps * 1000.0f);
+    ffRequestSeq = _seq;
+    ffRequestLeaseMs = _leaseMs;
+    ffRequestWriteSeq++; // Even: request is complete.
+    return true;
+}
+
+
+bool Motor::Controller::RequestDragCurrent(float _amps, uint16_t _seq, uint16_t _leaseMs)
+{
+    if (!config || !std::isfinite(_amps) ||
+        fabsf(_amps) * 1000.0f > config->feedForward.maxCurrent ||
+        _leaseMs < config->feedForward.minLeaseMs ||
+        _leaseMs > config->feedForward.maxLeaseMs ||
+        _seq == dragRequestSeq ||
+        !IsNewerSequence(_seq, lastDragSequence))
+        return false;
+
+    dragRequestWriteSeq++;
+    dragRequestCurrent_mA = static_cast<int32_t>(_amps * 1000.0f);
+    dragRequestSeq = _seq;
+    dragRequestLeaseMs = _leaseMs;
+    dragRequestWriteSeq++;
+    return true;
+}
+
+
+void Motor::Controller::ClearFeedForward()
+{
+    feedForwardCurrent_mA = 0;
+    feedForwardActive = false;
+    feedForwardLeaseTicks = 0;
+    feedForwardLimited = false;
+    dragActive = false;
+    dragLeaseTicks = 0;
+    goalCurrent = softCurrent = 0;
+}
+
+
+uint16_t Motor::Controller::GetRemainingLeaseMs() const
+{
+    const uint32_t ticks = feedForwardLeaseTicks > dragLeaseTicks ?
+                           feedForwardLeaseTicks : dragLeaseTicks;
+    return static_cast<uint16_t>(ticks / context->motionPlanner.CONTROL_TICKS_PER_MS);
+}
+
+
+void Motor::Controller::ConsumeFeedForwardRequest()
+{
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const uint32_t before = ffRequestWriteSeq;
+        if (before & 1) continue;
+        const int32_t mA = ffRequestCurrent_mA;
+        const uint16_t seq = ffRequestSeq;
+        const uint16_t lease = ffRequestLeaseMs;
+        if (before != ffRequestWriteSeq) continue;
+        if (seq != 0 && IsNewerSequence(seq, lastFeedForwardSequence))
+        {
+            lastFeedForwardSequence = seq;
+            feedForwardCurrent_mA = mA;
+            feedForwardActive = true;
+            feedForwardLeaseTicks = static_cast<uint32_t>(lease) *
+                                    context->motionPlanner.CONTROL_TICKS_PER_MS;
+        }
+        break;
+    }
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const uint32_t before = dragRequestWriteSeq;
+        if (before & 1) continue;
+        const int32_t mA = dragRequestCurrent_mA;
+        const uint16_t seq = dragRequestSeq;
+        const uint16_t lease = dragRequestLeaseMs;
+        if (before != dragRequestWriteSeq) continue;
+        if (seq != 0 && IsNewerSequence(seq, lastDragSequence))
+        {
+            lastDragSequence = seq;
+            if (modeRunning != MODE_COMMAND_CURRENT)
+                SetCtrlMode(MODE_COMMAND_CURRENT);
+            context->motionPlanner.currentTracker.SetCurrentAcc(config->feedForward.dragCurrentAcc);
+            SetCurrentSetPoint(mA);
+            dragActive = true;
+            dragLeaseTicks = static_cast<uint32_t>(lease) *
+                             context->motionPlanner.CONTROL_TICKS_PER_MS;
+        }
+        break;
+    }
+}
+
+
+void Motor::Controller::ReleaseDragLease()
+{
+    // A missed drag frame must fall back to the position hold, but must not
+    // latch motionBlocked; otherwise later fresh drag frames stay rejected.
+    dragActive = false;
+    ClearFeedForward();
+    RestoreCurrentAcceleration();
+    if (!holding) holdRequested = true;
+}
+
+
+void Motor::Controller::RestoreCurrentAcceleration()
+{
+    context->motionPlanner.currentTracker.SetCurrentAcc(context->config.motionParams.ratedCurrentAcc);
+}
+
+
+void Motor::Controller::UpdateFeedForwardLease()
+{
+    if (feedForwardActive && feedForwardLeaseTicks)
+    {
+        --feedForwardLeaseTicks;
+        if (!feedForwardLeaseTicks)
+        {
+            feedForwardActive = false;
+            feedForwardCurrent_mA = 0;
+        }
+    }
+    if (dragActive && dragLeaseTicks)
+    {
+        --dragLeaseTicks;
+        if (!dragLeaseTicks) ReleaseDragLease();
+    }
+}
+
+
 void Motor::Controller::SetDisable(bool _disable)
 {
     goalDisable = _disable;
@@ -552,11 +718,13 @@ void Motor::Controller::ClearStallFlag()
     // Clearing always leaves the motor stopped and discards the old target.
     motionBlocked = true;
     clearFaultsRequested = true;
+    ClearFeedForward();
 }
 
 void Motor::Controller::RequestHold()
 {
     motionBlocked = true;
+    ClearFeedForward();
     if (!holding) holdRequested = true;
 }
 
@@ -573,6 +741,7 @@ void Motor::Controller::SetEnable(bool enable)
     if (!enable)
     {
         SetCtrlMode(MODE_STOP);
+        ClearFeedForward();
         return;
     }
     if (GetFaultFlags() || clearFaultsRequested) return;
@@ -643,6 +812,24 @@ void Motor::Controller::Init()
     goalCurrent = 0;
     goalDisable = false;
     goalBrake = false;
+    ffRequestWriteSeq = 0;
+    ffRequestCurrent_mA = 0;
+    ffRequestSeq = 0;
+    ffRequestLeaseMs = 0;
+    dragRequestWriteSeq = 0;
+    dragRequestCurrent_mA = 0;
+    dragRequestSeq = 0;
+    dragRequestLeaseMs = 0;
+    feedForwardCurrent_mA = 0;
+    feedbackCurrent_mA = 0;
+    totalCurrent_mA = 0;
+    lastFeedForwardSequence = 0;
+    lastDragSequence = 0;
+    feedForwardLeaseTicks = 0;
+    dragLeaseTicks = 0;
+    feedForwardActive = false;
+    dragActive = false;
+    feedForwardLimited = false;
 
     softPosition = 0;
     softVelocity = 0;

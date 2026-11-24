@@ -20,6 +20,13 @@ public:
         config.motionParams.ratedVelocityAcc = 1000 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;
 
         config.ctrlParams.stallProtectSwitch = false;
+        config.ctrlParams.feedForward =
+            Controller::FeedForwardConfig_t{
+                .maxCurrent = 3300,             // (mA) RAM-only command ceiling
+                .dragCurrentAcc = 20 * 1000,    // (mA/s), faster than position-current ramps
+                .minLeaseMs = 10,
+                .maxLeaseMs = 1000
+            };
         config.ctrlParams.pid =
             Controller::PID_t{
                 .kp = 5,
@@ -99,8 +106,17 @@ public:
 
         typedef struct
         {
+            int32_t maxCurrent;    // (mA)
+            int32_t dragCurrentAcc; // (mA/s), only for leased drag commands
+            uint16_t minLeaseMs;
+            uint16_t maxLeaseMs;
+        } FeedForwardConfig_t;
+
+        typedef struct
+        {
             PID_t pid;
             DCE_t dce;
+            FeedForwardConfig_t feedForward;
 
             bool stallProtectSwitch;
         } Config_t;
@@ -125,6 +141,16 @@ public:
         void Init();
         void SetCtrlMode(Mode_t _mode);
         void SetCurrentSetPoint(int32_t _cur);
+        bool RequestCurrentFeedForward(float _amps, uint16_t _seq, uint16_t _leaseMs);
+        bool RequestDragCurrent(float _amps, uint16_t _seq, uint16_t _leaseMs);
+        void ClearFeedForward();
+        int32_t GetFeedbackCurrent_mA() const { return feedbackCurrent_mA; }
+        int32_t GetFeedForwardCurrent_mA() const { return feedForwardActive ? feedForwardCurrent_mA : 0; }
+        int32_t GetTotalCurrent_mA() const { return totalCurrent_mA; }
+        uint16_t GetFeedForwardSequence() const { return lastFeedForwardSequence; }
+        uint16_t GetDragSequence() const { return lastDragSequence; }
+        uint16_t GetRemainingLeaseMs() const;
+        bool IsFeedForwardLimited() const { return feedForwardLimited; }
         void SetVelocitySetPoint(int32_t _vel);
         void SetPositionSetPoint(int32_t _pos);
         bool SetPositionSetPointWithTime(int32_t _pos, float _time);
@@ -166,6 +192,26 @@ public:
         bool softDisable{};
         bool softBrake{};
         bool softNewCurve{};
+        // Current feed-forward is staged in a seqlock-protected request, then
+        // consumed once in the 20 kHz tick. It never changes control mode.
+        volatile uint32_t ffRequestWriteSeq{0};
+        volatile int32_t ffRequestCurrent_mA{0};
+        volatile uint16_t ffRequestSeq{0};
+        volatile uint16_t ffRequestLeaseMs{0};
+        volatile uint32_t dragRequestWriteSeq{0};
+        volatile int32_t dragRequestCurrent_mA{0};
+        volatile uint16_t dragRequestSeq{0};
+        volatile uint16_t dragRequestLeaseMs{0};
+        int32_t feedForwardCurrent_mA{0};
+        int32_t feedbackCurrent_mA{0};
+        int32_t totalCurrent_mA{0};
+        uint16_t lastFeedForwardSequence{0};
+        uint16_t lastDragSequence{0};
+        uint32_t feedForwardLeaseTicks{0};
+        uint32_t dragLeaseTicks{0};
+        bool feedForwardActive{false};
+        bool dragActive{false};
+        bool feedForwardLimited{false};
         int32_t focPosition{};
         uint32_t stalledTime{};
         uint32_t overloadTime{};
@@ -182,7 +228,12 @@ public:
         void CalcPidToOutput(int32_t _speed);
         void CalcDceToOutput(int32_t _location, int32_t _speed);
         void ClearIntegral() const;
+        void ConsumeFeedForwardRequest();
+        void UpdateFeedForwardLease();
+        void ReleaseDragLease();
+        void RestoreCurrentAcceleration();
 
+        static bool IsNewerSequence(uint16_t sequence, uint16_t last);
         static int32_t CompensateAdvancedAngle(int32_t _vel);
     };
 

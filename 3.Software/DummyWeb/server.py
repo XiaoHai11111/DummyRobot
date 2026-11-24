@@ -26,7 +26,7 @@ CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 JOINT_RESPONSE = re.compile(r"^okj\s+([-+\d.eE]+(?:\s+[-+\d.eE]+){5})$")
 POSE_RESPONSE = re.compile(r"^okl\s+([-+\d.eE]+(?:\s+[-+\d.eE]+){5})$")
-STATUS_RESPONSE = re.compile(r"^oks\s+([01])\s+([1-4])\s+(\d+)" + r"\s+(\d+)" * 6 + r"$")
+STATUS_RESPONSE = re.compile(r"^oks\s+([01])\s+([1-5])\s+(\d+)" + r"\s+(\d+)" * 6 + r"$")
 FLOAT_TOKEN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 
 
@@ -432,108 +432,31 @@ class RobotLink:
         return {"reply": line, "enabled": False}
 
     def send_user_command(self, text):
-        """Send one explicitly supported USB-CDC ASCII command from the UI."""
+        """Transparently send one line of ASCII data from the terminal window."""
         self._require()
-        command = str(text or "").strip()
-        if not command or len(command) > 128 or not command.isascii() or "\r" in command or "\n" in command:
-            raise ValueError("请输入一条不超过 128 字符的 ASCII 指令，不要包含换行")
+        command = str(text or "")
+        if not command.strip() or not command.isascii() or "\r" in command or "\n" in command:
+            raise ValueError("请输入一行非空 ASCII 数据；不会自动补空格或换行")
 
-        if command == "#GETSTATUS":
-            return {"command": command, **self.read_status()}
-        if command == "#GETCAN":
-            return {"command": command, "reply": self.command(
-                command, lambda value: bool(re.fullmatch(r"okc(?: \d+){6}", value)))}
-        if re.fullmatch(r"#GETDRV [1-6]", command):
-            joint = command[-1]
-            return {"command": command, "reply": self.command(
-                command, lambda value: bool(re.fullmatch(r"okd " + joint + r"(?: \d+){6}", value)))}
-        if re.fullmatch(r"#GETTIMING [1-6]", command):
-            joint = command[-1]
-            return {"command": command, "reply": self.command(
-                command, lambda value: bool(re.fullmatch(r"okt " + joint + r"(?: \d+){3}", value)))}
-        if command == "!CLEARFAULT":
-            return {"command": command, **self.clear_faults()}
-        if command == "#GETJPOS":
-            values = self.read_joints()
-            return {"command": command, "reply": "okj " + " ".join(f"{v:.2f}" for v in values)}
-        if command == "#GETLPOS":
-            values = self.read_pose()
-            return {"command": command, "reply": "okl " + " ".join(f"{v:.2f}" for v in values)}
+        reply = self.command(command)
+        result = {"command": command, "reply": reply}
         if command == "!START":
-            if self.busy:
-                raise RuntimeError("Homing/Resting 正在执行，当前不能改变使能状态")
-            return {"command": command, **self.set_enabled(True)}
-        if command == "!DISABLE":
-            if self.busy:
-                raise RuntimeError("Homing/Resting 正在执行；如需中止请发送 !STOP")
-            return {"command": command, **self.set_enabled(False)}
-        if command == "!STOP":
-            return {"command": command, **self.stop()}
-
-        match = re.fullmatch(r"#GRIP\s+(" + FLOAT_TOKEN + r")", command)
-        if match:
-            if not self.enabled:
-                raise RuntimeError("发送夹爪指令前请先使能机械臂")
-            angle = float(match.group(1))
-            result = self.set_gripper(angle)
-            return {"command": command, **result}
-
-        match = re.fullmatch(r"#GRIP_CURRENT\s+(" + FLOAT_TOKEN + r")", command)
-        if match:
-            if not self.enabled:
-                raise RuntimeError("设置夹爪电流前请先使能机械臂")
-            if self.busy:
-                raise RuntimeError("Homing/Resting 正在执行，当前不能设置夹爪电流")
-            current = float(match.group(1))
-            if not 0.0 <= current <= 1.0:
-                raise ValueError("夹爪电流参数范围为 0 到 1")
-            reply = self.command(command, lambda line: "Grip current" in line)
-            return {"command": command, "reply": reply}
-
-        match = re.fullmatch(r"#CMDMODE\s+([1-4])", command)
-        if match:
-            if self.busy:
-                raise RuntimeError("Homing/Resting 正在执行，当前不能切换命令模式")
-            return {"command": command, "reply": self.set_mode(int(match.group(1)))}
-
+            self.enabled = True
+        elif command in ("!DISABLE", "!STOP"):
+            self.enabled = False
+        else:
+            match = re.fullmatch(r"#CMDMODE\s+(-?\d+)", command)
+            if match:
+                self.command_mode = int(match.group(1))
+            else:
+                match = re.fullmatch(r"#GRIP\s+(" + FLOAT_TOKEN + r")", command)
+                if match:
+                    self.gripper_deg = float(match.group(1))
         if command[0] in ">@":
-            values_text = command[1:].split(",")
-            expected_counts = {">": (7, 8, 9), "@": (7,)}
-            if len(values_text) not in expected_counts[command[0]]:
-                if command[0] == ">":
-                    raise ValueError("> 指令格式：>J1,J2,J3,J4,J5,J6,速度[,夹爪角[,夹爪电流]]")
-                raise ValueError(f"{command[0]} 指令格式：{command[0]}六个目标值,速度")
-            try:
-                values = [float(value) for value in values_text]
-            except ValueError as exc:
-                raise ValueError("运动指令中的参数必须是数字") from exc
-            if not all(map(lambda value: value == value and abs(value) != float("inf"), values)):
-                raise ValueError("运动指令中的参数必须是有限数值")
-            if not self.enabled:
-                raise RuntimeError("发送运动指令前请先使能机械臂")
-            if self.busy:
-                raise RuntimeError("Homing/Resting 正在执行，当前不能发送运动指令")
-            joint_limits = CONFIG["robot"]["joints"]
-            if command[0] == ">":
-                for index, (angle, limit) in enumerate(zip(values[:6], joint_limits), 1):
-                    if not limit["min_deg"] <= angle <= limit["max_deg"]:
-                        raise ValueError(f"J{index}={angle:g}° 超出范围 [{limit['min_deg']}, {limit['max_deg']}]°")
-            speed = float(CONFIG["robot"]["joint_speed_deg_s"])
-            if abs(values[6] - speed) > 1e-6:
-                raise ValueError(f"运动速度必须为配置值 {speed:g}°/s")
-            if command[0] == ">" and len(values) >= 8:
-                gripper = CONFIG["robot"]["gripper"]
-                if not gripper["min_deg"] <= values[7] <= gripper["max_deg"]:
-                    raise ValueError(f"夹爪角需在 [{gripper['min_deg']}, {gripper['max_deg']}]°")
-            if command[0] == ">" and len(values) == 9 and not 0.0 <= values[8] <= 1.0:
-                raise ValueError("夹爪电流参数范围为 0 到 1")
-            reply = self.command(command, self.queue_reply)
-            note = "固件已接收指令；串口回包不代表机械臂已到位"
+            result["note"] = "固件已接收指令；串口回包不代表机械臂已到位"
             if reply.isdigit():
-                note = f"指令已进入运动队列（剩余空间 {reply}）；请看实际遥测确认到位"
-            return {"command": command, "reply": reply, "note": note}
-
-        raise ValueError("不支持该指令。请使用 README 中列出的 USB-CDC ASCII 指令")
+                result["note"] = f"指令已进入运动队列（剩余空间 {reply}）；请看实际遥测确认到位"
+        return result
 
 
 class CameraLink:

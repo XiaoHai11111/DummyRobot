@@ -59,6 +59,58 @@ void CtrlStepMotor::SetCurrentSetPoint(float _val)
 }
 
 
+void CtrlStepMotor::SetCurrentFeedForward(float _val, uint16_t _seq, uint16_t _leaseMs)
+{
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
+    txHeader.StdId = nodeID << 7 | 0x0A;
+
+    auto* b = reinterpret_cast<unsigned char*>(&_val);
+    for (int i = 0; i < 4; i++) canBuf[i] = *(b + i);
+    b = reinterpret_cast<unsigned char*>(&_seq);
+    for (int i = 0; i < 2; i++) canBuf[4 + i] = *(b + i);
+    b = reinterpret_cast<unsigned char*>(&_leaseMs);
+    for (int i = 0; i < 2; i++) canBuf[6 + i] = *(b + i);
+
+    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+}
+
+
+void CtrlStepMotor::SetDragCurrent(float _val, uint16_t _seq, uint16_t _leaseMs)
+{
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
+    txHeader.StdId = nodeID << 7 | 0x0B;
+
+    auto* b = reinterpret_cast<unsigned char*>(&_val);
+    for (int i = 0; i < 4; i++) canBuf[i] = *(b + i);
+    b = reinterpret_cast<unsigned char*>(&_seq);
+    for (int i = 0; i < 2; i++) canBuf[4 + i] = *(b + i);
+    b = reinterpret_cast<unsigned char*>(&_leaseMs);
+    for (int i = 0; i < 2; i++) canBuf[6 + i] = *(b + i);
+
+    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+}
+
+
+void CtrlStepMotor::RequestVelocityFeedback()
+{
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
+    txHeader.StdId = nodeID << 7 | 0x22;
+    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+}
+
+
+void CtrlStepMotor::RequestPositionFeedback()
+{
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
+    txHeader.StdId = nodeID << 7 | 0x23;
+    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+}
+
+
 void CtrlStepMotor::SetVelocitySetPoint(float _val)
 {
     state = RUNNING;
