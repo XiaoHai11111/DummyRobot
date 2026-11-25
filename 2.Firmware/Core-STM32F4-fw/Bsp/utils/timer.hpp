@@ -19,6 +19,8 @@ private:
 public:
     explicit Timer(TIM_HandleTypeDef *_htim, uint32_t _freqHz = 100);
 
+    uint32_t GetFrequencyHz() const;
+
     void SetCallback(TimerCallback_t _timerCallback);
 
     void Start();

@@ -4,21 +4,48 @@
 #include <string>
 
 #include "algorithms/kinematic/6dof_kinematic.h"
-#include "algorithms/gravity_compensation/gravity_compensation.hpp"
+#include "algorithms/gravity_compensation/gravity_compensation.h"
 #include "actuators/ctrl_step/ctrl_step.hpp"
 
 #define ALL 0
 
 /*
-  |   PARAMS   | `current_limit` | `acceleration` | `dce_
-  kp` | `dce_kv` | `dce_ki` | `dce_kd` |
+  |   PARAMS   | `current_limit` | `acceleration` | `dce_kp` | `dce_kv` | `dce_ki` | `dce_kd` |
   | ---------- | --------------- | -------------- | -------- | -------- | -------- | -------- |
-  | **Joint1** | 2               | 30             | 1000     | 80       | 200      | 250      |
-  | **Joint2** | 2               | 30             | 1000     | 80       | 200      | 200      |
-  | **Joint3** | 2               | 30             | 1500     | 80       | 200      | 250      |
-  | **Joint4** | 2               | 30             | 1000     | 80       | 200      | 250      |
-  | **Joint5** | 2               | 30             | 1000     | 80       | 200      | 250      |
-  | **Joint6** | 2               | 30             | 1000     | 80       | 200      | 250      |
+  | **Joint1** | 3               | 30             | 1000     | 80       | 200      | 250      |
+  | **Joint2** | 3               | 30             | 1000     | 80       | 200      | 200      |
+  | **Joint3** | 3               | 30             | 1500     | 80       | 200      | 250      |
+  | **Joint4** | 3               | 30             | 1000     | 80       | 200      | 250      |
+  | **Joint5** | 3               | 30             | 1000     | 80       | 200      | 250      |
+  | **Joint6** | 3               | 30             | 1000     | 80       | 200      | 250      |
+ */
+
+/*
+  Stage 2 F1 local compensation candidate parameters. The columns, order and
+  units are exactly the same as F1 BoardConfig_t and #LOCALCOMP:
+
+  #LOCALCOMP <joint> <damping> <coulomb> <viscous> <deadzone> <limit> [store]
+
+  damping: mA per motor rev/s; coulomb: mA; viscous: mA per motor rev/s;
+  deadzone: motor rev/s x1000; limit: mA. F1 constructor defaults are all zero;
+  main.cpp loads these values from BoardConfig_t at boot. Zero limit disables
+  stage-2 compensation, which only acts while the leased drag current is valid.
+
+  The values below are the fixed-point BoardConfig_t values converted from the
+  fitted joint-domain coefficients using each joint's reduction. Damping has no
+  fitted result and stays at zero. The 500 mA limit is a conservative
+  engineering cap for the correction term, not a fitted value. Deadzone must be
+  above the F1 encoder-speed quantization (~0.012 motor rev/s); the values below
+  correspond to ~0.3 joint deg/s at each reduction and are clamped by F4/F1.
+
+  |   PARAMS   | `damping` | `coulomb` | `viscous` | `deadzone` | `limit` |
+  | ---------- | --------- | --------- | --------- | ---------- | ------- |
+  | **Joint1** | 0         | 77        | 24        | 42         | 500     |
+  | **Joint2** | 0         | 125       | 69        | 25         | 500     |
+  | **Joint3** | 0         | 102       | 19        | 25         | 500     |
+  | **Joint4** | 0         | 250       | 54        | 25         | 500     |
+  | **Joint5** | 0         | 185       | 44        | 25         | 500     |
+  | **Joint6** | 0         | 167       | 0         | 42         | 500     |
  */
 
 
@@ -74,6 +101,38 @@ public:
         COMMAND_MOTOR_TUNING,
         COMMAND_DRAG = 5
     };
+
+
+    // Indexed by joint 1..6. Derived from the F1 1/32 velocity filter and each
+    // joint reduction so #LOCALCOMP cannot inject Coulomb assist on encoder dither.
+    static constexpr int32_t LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[7] = {
+        0, 42, 25, 25, 25, 25, 42
+    };
+
+
+    struct Config_t
+    {
+        uint32_t controlFrequencyHz;
+        uint16_t gravityFeedForwardHz;
+        uint16_t feedForwardLeaseMs;
+        uint16_t dragFeedbackHz;
+        uint16_t dragLeaseMs;
+        uint16_t dragVelocityValidMs;
+        float dragVelocityFilterAlpha;
+        float dragVelocitySmoothingDegS;
+        float dragVelocityCutoffDegS;
+        float dragEndStopMarginDeg;
+        float dragDamping;
+        float dragFrictionAlpha;
+        float dragCurrentLimit;
+        float dragDampingMax;
+        float dragFrictionAlphaMax;
+        float dragCurrentLimitMin;
+        float dragCurrentLimitMax;
+        bool gravityFeedForwardEnabled;
+
+        Config_t();
+    } config;
 
 
     class TuningHelper
@@ -149,8 +208,8 @@ public:
     void SetCommandMode(uint32_t _mode);
     void UpdateGravityFeedForward(uint32_t tick);
     void DragTick(uint32_t tick);
-    void SetGravityFeedForwardEnabled(bool _enabled) { gravityFeedForwardEnabled = _enabled; }
-    bool IsGravityFeedForwardEnabled() const { return gravityFeedForwardEnabled; }
+    void SetGravityFeedForwardEnabled(bool _enabled);
+    bool IsGravityFeedForwardEnabled() const;
     void SetDragGains(float _damping, float _frictionAlpha, float _currentLimit);
     void GetDragGains(float* _gains) const;
     void CheckSafety();
@@ -159,8 +218,8 @@ public:
     uint8_t GetFaultJointMask() const;
     uint8_t GetJointFault(unsigned joint) const { return jointFaults[joint]; }
     uint32_t GetFaultFeedbackAge(unsigned joint) const { return faultFeedbackAge[joint]; }
-    uint16_t GetFeedForwardSequence() const { return feedForwardSequence; }
-    uint16_t GetDragSequence() const { return dragSequence; }
+    uint16_t GetFeedForwardSequence() const;
+    uint16_t GetDragSequence() const;
     void StopMotion();
     bool WaitForMotion(uint32_t timeoutMs = 0);
     bool IsHolding() const { return holdOnStop; }
@@ -241,12 +300,8 @@ private:
     uint32_t safetyStarted = 0;
     uint32_t motionTimeoutMs = 30000;
     uint32_t enabledAt = 0;
-    bool gravityFeedForwardEnabled = false;
     uint16_t feedForwardSequence = 0;
     uint16_t dragSequence = 0;
-    float dragDamping = 0.0f;
-    float dragFrictionAlpha = 0.0f;
-    float dragCurrentLimit = 1.0f;
     float dragVelocityFiltered[7]{};
 };
 

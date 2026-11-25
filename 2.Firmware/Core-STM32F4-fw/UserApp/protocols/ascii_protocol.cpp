@@ -145,6 +145,31 @@ static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
             dummy.SetDragGains(damping, frictionAlpha, currentLimit);
             Respond(response, "Drag gains %.3f %.3f %.3f", damping, frictionAlpha, currentLimit);
         }
+    } else if (text.rfind("#LOCALCOMP ", 0) == 0)
+    {
+        unsigned joint, store;
+        int32_t damping, coulomb, viscous, deadzone, limit;
+        char extra;
+        const int fields = sscanf(cmd, "#LOCALCOMP %u %d %d %d %d %d %u %c", &joint, &damping,
+                                  &coulomb, &viscous, &deadzone, &limit, &store, &extra);
+        const bool validFields = (fields == 6) || (fields == 7 && store <= 1);
+        if (!validFields || joint < 1 || joint > 6 ||
+            damping < 0 || damping > 1000000 || coulomb < 0 || coulomb > 3300 ||
+            viscous < 0 || viscous > 1000000 || deadzone < 0 || deadzone > 1000000 ||
+            limit < 0 || limit > 3300)
+            Respond(response, "error invalid local compensation");
+        else
+        {
+            const int32_t appliedDeadzone =
+                deadzone < DummyRobot::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[joint] ?
+                DummyRobot::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[joint] : deadzone;
+            dummy.motorJ[joint]->SetLocalCompensation(damping, coulomb, viscous,
+                                                       appliedDeadzone, limit,
+                                                       fields == 7 && store == 1);
+            Respond(response, "Local compensation J%u %d %d %d %d %d%s",
+                    joint, damping, coulomb, viscous, appliedDeadzone, limit,
+                    fields == 7 && store == 1 ? " stored" : "");
+        }
     } else if (text == "#GETDRAG")
     {
         float gains[3];

@@ -27,6 +27,16 @@ public:
                 .minLeaseMs = 10,
                 .maxLeaseMs = 1000
             };
+        config.ctrlParams.localComp =
+            Controller::LocalCompensationConfig_t{
+                .damping_mA_per_motorRevS = 0,
+                .coulomb_mA = 0,
+                .viscous_mA_per_motorRevS = 0,
+                .deadzoneSteps = 0,
+                .limit_mA = 0,
+                .assistCoeffQ16 = 0,
+                .rampInvQ16 = 0
+            };
         config.ctrlParams.pid =
             Controller::PID_t{
                 .kp = 5,
@@ -83,6 +93,10 @@ public:
     public:
         friend Motor;
 
+        // One encoder step per 20 kHz tick becomes ~625 steps/s after the 1/32
+        // velocity filter, i.e. ~12 in BoardConfig units. 20 leaves margin.
+        static constexpr int32_t LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000 = 20;
+
         typedef struct
         {
             bool kpValid, kiValid, kdValid;
@@ -114,9 +128,21 @@ public:
 
         typedef struct
         {
+            int32_t damping_mA_per_motorRevS;   // opposes local motor velocity
+            int32_t coulomb_mA;                 // assists in velocity direction
+            int32_t viscous_mA_per_motorRevS;   // assists in velocity direction
+            int32_t deadzoneSteps;              // estVelocity threshold, steps/s
+            int32_t limit_mA;                   // 0 disables local compensation
+            int32_t assistCoeffQ16;              // (viscous - damping) / steps per rev, Q16
+            int32_t rampInvQ16;                  // 65536 / deadzoneSteps, Q16
+        } LocalCompensationConfig_t;
+
+        typedef struct
+        {
             PID_t pid;
             DCE_t dce;
             FeedForwardConfig_t feedForward;
+            LocalCompensationConfig_t localComp;
 
             bool stallProtectSwitch;
         } Config_t;
@@ -143,14 +169,15 @@ public:
         void SetCurrentSetPoint(int32_t _cur);
         bool RequestCurrentFeedForward(float _amps, uint16_t _seq, uint16_t _leaseMs);
         bool RequestDragCurrent(float _amps, uint16_t _seq, uint16_t _leaseMs);
+        bool SetLocalCompensationParam(uint8_t _index, int32_t _value, bool _storeToEeprom = false);
         void ClearFeedForward();
-        int32_t GetFeedbackCurrent_mA() const { return feedbackCurrent_mA; }
-        int32_t GetFeedForwardCurrent_mA() const { return feedForwardActive ? feedForwardCurrent_mA : 0; }
-        int32_t GetTotalCurrent_mA() const { return totalCurrent_mA; }
-        uint16_t GetFeedForwardSequence() const { return lastFeedForwardSequence; }
-        uint16_t GetDragSequence() const { return lastDragSequence; }
+        int32_t GetFeedbackCurrent_mA() const;
+        int32_t GetFeedForwardCurrent_mA() const;
+        int32_t GetTotalCurrent_mA() const;
+        uint16_t GetFeedForwardSequence() const;
+        uint16_t GetDragSequence() const;
         uint16_t GetRemainingLeaseMs() const;
-        bool IsFeedForwardLimited() const { return feedForwardLimited; }
+        bool IsFeedForwardLimited() const;
         void SetVelocitySetPoint(int32_t _vel);
         void SetPositionSetPoint(int32_t _pos);
         bool SetPositionSetPointWithTime(int32_t _pos, float _time);
@@ -224,6 +251,7 @@ public:
 
 
         void AttachConfig(Config_t* _config);
+        int32_t ApplyLeaseLocalCompensation(int32_t current);
         void CalcCurrentToOutput(int32_t current);
         void CalcPidToOutput(int32_t _speed);
         void CalcDceToOutput(int32_t _location, int32_t _speed);

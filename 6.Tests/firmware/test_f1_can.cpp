@@ -71,6 +71,37 @@ int main() {
     motor.controller->SetCtrlMode(Motor::MODE_STOP);
     motor.Tick20kHz(); // Consume the one-time first-call encoder initialization.
 
+    // Stage 2 local compensation uses F1 BoardConfig fixed-point integers.
+    int32_t localValue = 250;
+    memcpy(data, &localValue, 4);
+    data[4] = 2;
+    data[5] = 1;
+    const auto localCount = replies;
+    OnCanCmd(0x0C, data, 4);
+    assert(replies == localCount);
+    OnCanCmd(0x0C, data, 8);
+    assert(motor.controller->config->localComp.viscous_mA_per_motorRevS == 250);
+    assert(boardConfig.localViscous_mA_per_motorRevS == 250);
+    assert(boardConfig.configStatus == CONFIG_RESTORE); // First frames do not commit flash.
+
+    data[4] = 5;
+    OnCanCmd(0x0C, data, 8);
+    assert(motor.controller->config->localComp.viscous_mA_per_motorRevS == 250);
+
+    data[4] = 4;
+    localValue = 800;
+    memcpy(data, &localValue, 4);
+    OnCanCmd(0x0C, data, 8);
+    assert(motor.controller->config->localComp.limit_mA == 800);
+    assert(boardConfig.localCompLimit_mA == 800);
+    assert(boardConfig.configStatus == CONFIG_COMMIT);
+    boardConfig.configStatus = CONFIG_OK;
+
+    localValue = 4000;
+    memcpy(data, &localValue, 4);
+    OnCanCmd(0x0C, data, 8);
+    assert(motor.controller->config->localComp.limit_mA == 800);
+
     float ff = 0.4f;
     uint16_t ffSeq = 1, lease = 100;
     memcpy(data, &ff, 4);

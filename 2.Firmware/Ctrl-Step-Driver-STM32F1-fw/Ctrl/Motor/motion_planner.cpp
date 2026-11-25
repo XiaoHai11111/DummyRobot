@@ -368,8 +368,9 @@ void MotionPlanner::PositionInterpolator::CalcSoftGoal(int32_t _goalPosition)
     recordPositionLast = recordPosition;
     recordPosition = _goalPosition;
 
-    estPositionIntegral += (((recordPosition - recordPositionLast) * context->CONTROL_FREQUENCY)
-                            + ((estVelocity << 6) - estVelocity));
+    // 64-tick moving average; the residual subtraction already removes the old
+    // average. Adding back 63 * estVelocity would make this filter unstable.
+    estPositionIntegral += (recordPosition - recordPositionLast) * context->CONTROL_FREQUENCY;
     estVelocity = estPositionIntegral >> 6;
     estPositionIntegral -= (estVelocity << 6);
 

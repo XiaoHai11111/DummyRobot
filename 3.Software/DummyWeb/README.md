@@ -59,6 +59,7 @@ cd /home/xiaohai/workspace/DummyRobot/3.Software/DummyWeb
 | 重力前馈 | `#GRAVITY_FF_ON` / `#GRAVITY_FF_OFF` | 控制 F4 是否发送非零重力前馈；默认关闭 |
 | 拖动增益 | `#DRAG_GAIN damping friction_alpha current_limit` | 设置拖动阻尼、摩擦补偿系数和关节电流上限 |
 | 拖动参数查询 | `#GETDRAG` | 返回当前命令模式、使能状态和拖动增益 |
+| F1 本地补偿 | `#LOCALCOMP joint damping coulomb viscous deadzone limit [store]` | 配置指定关节的本地阻尼、库仑补偿、粘滞补偿、速度死区和补偿限幅；参数直接使用 F1 `BoardConfig_t` 定点单位：阻尼/粘滞为 mA/(motor rev/s)，库仑/限幅为 mA，死区为 motor rev/s ×1000。可直接照 `dummy_robot.h` 表格填写；`store=1` 时保存到 F1 EEPROM，仅拖动租约有效时生效 |
 
 `>` 命令还支持夹爪扩展格式：`>j1,j2,j3,j4,j5,j6,speed,gripper_angle` 和九参数格式 `>j1,j2,j3,j4,j5,j6,speed,gripper_angle,gripper_current`。固件支持 6–9 参数的 `>` 和 6–7 参数的 `@`；有效入队回复为 `0–16`，`error ...` 为失败。网页不改写这些数值。
 

@@ -174,6 +174,8 @@ void OnTimer7Callback()
 /* Default Entry -------------------------------------------------------*/
 void Main(void)
 {
+    dummy.config.controlFrequencyHz = timerCtrlLoop.GetFrequencyHz();
+
     // Init all communication staff, including USB-CDC/VCP/UART/CAN etc.
     InitCommunication();
 

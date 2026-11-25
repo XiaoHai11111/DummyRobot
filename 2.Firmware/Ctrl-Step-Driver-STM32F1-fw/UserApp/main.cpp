@@ -23,7 +23,7 @@ static uint32_t controlBudgetCycles;
 void Main()
 {
     uint64_t serialNum = GetSerialNumber();
-    uint16_t defaultNodeID = 6;
+    uint16_t defaultNodeID = 1;
 
     /*---------- Apply EEPROM Settings ----------*/
     // Setting priority is EEPROM > Motor.h
@@ -36,23 +36,42 @@ void Main()
             .canNodeId = defaultNodeID,
             .encoderHomeOffset = 0,
             .defaultMode = Motor::MODE_COMMAND_POSITION,
-            .currentLimit = 3 * 1000,    // A
-            .velocityLimit = 60 * motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS, // r/s
-            .velocityAcc = 100 * motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS,   // r/s^2
-            .calibrationCurrent=2000,
+            .currentLimit = 3 * 1000,    // mA
+            .velocityLimit = 60 * motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS, // steps/s
+            .velocityAcc = 100 * motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS,  // steps/s^2
+            .calibrationCurrent = 2000,  // mA
             .dce_kp = 1000,
             .dce_kv = 80,
             .dce_ki = 200,
             .dce_kd = 250,
-            .enableMotorOnBoot=false,
-            .enableStallProtect=false
+            .enableMotorOnBoot = false,
+            .enableStallProtect = false,
+            // Stage 2 local compensation defaults. Fitted candidates are
+            // documented in dummy_robot.h and configured per board by F4.
+            .localDamping_mA_per_motorRevS = 0,
+            .localCoulomb_mA = 0,
+            .localViscous_mA_per_motorRevS = 0,
+            .localDeadzone_motorRevS_x1000 =
+                Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000,
+            .localCompLimit_mA = 0,
+            .version = BOARD_CONFIG_VERSION
         };
+        eeprom.put(0, boardConfig);
+    } else if (boardConfig.version != BOARD_CONFIG_VERSION)
+    {
+        // Preserve legacy values and initialize only the appended stage-2 fields.
+        boardConfig.localDamping_mA_per_motorRevS = 0;
+        boardConfig.localCoulomb_mA = 0;
+        boardConfig.localViscous_mA_per_motorRevS = 0;
+        boardConfig.localDeadzone_motorRevS_x1000 =
+            Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000;
+        boardConfig.localCompLimit_mA = 0;
+        boardConfig.version = BOARD_CONFIG_VERSION;
         eeprom.put(0, boardConfig);
     }
     motor.config.motionParams.encoderHomeOffset = boardConfig.encoderHomeOffset;
     motor.config.motionParams.ratedCurrent = boardConfig.currentLimit;
     motor.config.ctrlParams.feedForward.maxCurrent = boardConfig.currentLimit;
-    motor.config.ctrlParams.feedForward.dragCurrentAcc = 20 * 1000;
     motor.config.motionParams.ratedVelocity = boardConfig.velocityLimit;
     motor.config.motionParams.ratedVelocityAcc = boardConfig.velocityAcc;
     motor.motionPlanner.velocityTracker.SetVelocityAcc(boardConfig.velocityAcc);
@@ -63,6 +82,11 @@ void Main()
     motor.config.ctrlParams.dce.ki = boardConfig.dce_ki;
     motor.config.ctrlParams.dce.kd = boardConfig.dce_kd;
     motor.config.ctrlParams.stallProtectSwitch = boardConfig.enableStallProtect;
+    motor.controller->SetLocalCompensationParam(0, boardConfig.localDamping_mA_per_motorRevS);
+    motor.controller->SetLocalCompensationParam(1, boardConfig.localCoulomb_mA);
+    motor.controller->SetLocalCompensationParam(2, boardConfig.localViscous_mA_per_motorRevS);
+    motor.controller->SetLocalCompensationParam(3, boardConfig.localDeadzone_motorRevS_x1000);
+    motor.controller->SetLocalCompensationParam(4, boardConfig.localCompLimit_mA);
 
 
     /*---------------- Init Motor ----------------*/
@@ -82,8 +106,8 @@ void Main()
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    // Reserve 10% of the 50-us period for wrapper/IRQ overhead and CAN service.
-    controlBudgetCycles = (SystemCoreClock / 20000U) * 9U / 10U;
+    // Reserve 10% of one control period for wrapper/IRQ overhead and CAN service.
+    controlBudgetCycles = (SystemCoreClock / static_cast<uint32_t>(motor.motionPlanner.CONTROL_FREQUENCY)) * 9U / 10U;
     HAL_Delay(100);
     HAL_TIM_Base_Start_IT(&htim1);  // 100Hz
     HAL_TIM_Base_Start_IT(&htim4);  // 20kHz

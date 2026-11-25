@@ -86,10 +86,10 @@ void Motor::CloseLoopControlTick()
 
     /********************************* Estimate Data *********************************/
     // Estimate Velocity
-    controller->estVelocityIntegral += (
-        (controller->realPosition - controller->realPositionLast) * motionPlanner.CONTROL_FREQUENCY
-        + ((controller->estVelocity << 5) - controller->estVelocity)
-    );
+    // 32-tick moving average. The residual keeps the fractional part; adding
+    // back 31 * estVelocity here would turn the filter into positive feedback.
+    controller->estVelocityIntegral +=
+        (controller->realPosition - controller->realPositionLast) * motionPlanner.CONTROL_FREQUENCY;
     controller->estVelocity = controller->estVelocityIntegral >> 5;
     controller->estVelocityIntegral -= (controller->estVelocity << 5);
 
@@ -160,7 +160,7 @@ void Motor::CloseLoopControlTick()
                 controller->CalcDceToOutput(controller->softPosition, controller->softVelocity);
                 break;
             case MODE_COMMAND_CURRENT:
-                controller->CalcCurrentToOutput(controller->softCurrent);
+                controller->CalcCurrentToOutput(controller->ApplyLeaseLocalCompensation(controller->softCurrent));
                 break;
             case MODE_COMMAND_VELOCITY:
                 controller->CalcPidToOutput(controller->softVelocity);
@@ -380,6 +380,18 @@ void Motor::CloseLoopControlTick()
 }
 
 
+int32_t Motor::Controller::ApplyLeaseLocalCompensation(int32_t current)
+{
+    if (!dragActive || dragLeaseTicks == 0) return current;
+    const LocalCompensationConfig_t& compensation = config->localComp;
+    return ApplyLocalCompensationQ16(current, estVelocity,
+                                     compensation.assistCoeffQ16, compensation.coulomb_mA,
+                                     compensation.deadzoneSteps, compensation.rampInvQ16,
+                                     compensation.limit_mA,
+                                     context->config.motionParams.ratedCurrent);
+}
+
+
 void Motor::Controller::CalcCurrentToOutput(int32_t current)
 {
     focCurrent = current;
@@ -580,6 +592,62 @@ bool Motor::Controller::RequestCurrentFeedForward(float _amps, uint16_t _seq, ui
 }
 
 
+bool Motor::Controller::SetLocalCompensationParam(uint8_t _index, int32_t _value, bool _storeToEeprom)
+{
+    if (!config || _value < 0 || _index > 4)
+        return false;
+
+    const int32_t maximum = (_index == 1 || _index == 4) ? 3300 : 1000000;
+    if (_value > maximum)
+        return false;
+    if (_index == 3 && _value < LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000)
+        _value = LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000;
+
+    LocalCompensationConfig_t* local = &config->localComp;
+    switch (_index)
+    {
+        case 0: local->damping_mA_per_motorRevS = _value; break;
+        case 1: local->coulomb_mA = _value; break;
+        case 2: local->viscous_mA_per_motorRevS = _value; break;
+        case 3: local->deadzoneSteps =
+                    static_cast<int32_t>((static_cast<int64_t>(_value) *
+                                          context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS + 500) / 1000);
+            break;
+        case 4: local->limit_mA = _value; break;
+        default: return false;
+    }
+
+    const int64_t assist_mA_per_rev =
+        static_cast<int64_t>(local->viscous_mA_per_motorRevS) -
+        local->damping_mA_per_motorRevS;
+    local->assistCoeffQ16 = static_cast<int32_t>(
+        (assist_mA_per_rev * 65536 + context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 2) /
+        context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS);
+    local->rampInvQ16 = local->deadzoneSteps > 0 ?
+        static_cast<int32_t>((65536 + local->deadzoneSteps / 2) / local->deadzoneSteps) : 0;
+
+    if (_storeToEeprom)
+    {
+        switch (_index)
+        {
+            case 0: boardConfig.localDamping_mA_per_motorRevS = _value; break;
+            case 1: boardConfig.localCoulomb_mA = _value; break;
+            case 2: boardConfig.localViscous_mA_per_motorRevS = _value; break;
+            case 3: boardConfig.localDeadzone_motorRevS_x1000 = _value; break;
+            case 4: boardConfig.localCompLimit_mA = _value; break;
+            default: break;
+        }
+        // The five frames are one group; only the last frame commits EEPROM.
+        if (_index == 4)
+        {
+            boardConfig.version = BOARD_CONFIG_VERSION;
+            boardConfig.configStatus = CONFIG_COMMIT;
+        }
+    }
+    return true;
+}
+
+
 bool Motor::Controller::RequestDragCurrent(float _amps, uint16_t _seq, uint16_t _leaseMs)
 {
     if (!config || !std::isfinite(_amps) ||
@@ -608,6 +676,42 @@ void Motor::Controller::ClearFeedForward()
     dragActive = false;
     dragLeaseTicks = 0;
     goalCurrent = softCurrent = 0;
+}
+
+
+int32_t Motor::Controller::GetFeedbackCurrent_mA() const
+{
+    return feedbackCurrent_mA;
+}
+
+
+int32_t Motor::Controller::GetFeedForwardCurrent_mA() const
+{
+    return feedForwardActive ? feedForwardCurrent_mA : 0;
+}
+
+
+int32_t Motor::Controller::GetTotalCurrent_mA() const
+{
+    return totalCurrent_mA;
+}
+
+
+uint16_t Motor::Controller::GetFeedForwardSequence() const
+{
+    return lastFeedForwardSequence;
+}
+
+
+uint16_t Motor::Controller::GetDragSequence() const
+{
+    return lastDragSequence;
+}
+
+
+bool Motor::Controller::IsFeedForwardLimited() const
+{
+    return feedForwardLimited;
 }
 
 

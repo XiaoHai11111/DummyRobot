@@ -73,6 +73,7 @@ int main() {
     now = 0;
     fresh();
     StreamSink usb, uart; uart.channelType = StreamSink::CHANNEL_TYPE_UART4;
+
     ascii(">0,-75,180,0,0,0,30,40,0.6", usb);
     assert(usb.output == "15\r\n");
     dummy.commandHandler.ParseCommand(dummy.commandHandler.Pop(0));
@@ -166,13 +167,43 @@ int main() {
     ascii("#DRAG_GAIN 0.01 0.25 1.0", usb);
     assert(usb.output.find("Drag gains") == 0);
     ascii("#DRAG_GAIN nan 0.25 1.0", usb); assert(usb.output.find("error") == 0);
+
+    // Stage 2 local compensation accepts F1 BoardConfig units and sends five RAM frames.
+    frames.clear(); ascii("#LOCALCOMP 2 0 125 69 0 500", usb);
+    assert(usb.output.find("Local compensation J2") == 0 && frames.size() == 5);
+    const int32_t expectedLocal[5] = {0, 125, 69, 25, 500};
+    for (unsigned i = 0; i < frames.size(); ++i)
+    {
+        int32_t sent = 0;
+        memcpy(&sent, frames[i].data.data(), 4);
+        assert(frames[i].header.StdId == ((2U << 7) | 0x0C));
+        assert(sent == expectedLocal[i]);
+        assert(frames[i].data[4] == i);
+        assert(frames[i].data[5] == 0);
+    }
+    frames.clear(); ascii("#LOCALCOMP 2 0 125 69 0 500 1", usb);
+    assert(usb.output.find("Local compensation J2") == 0 &&
+           usb.output.find("stored") != std::string::npos && frames.size() == 5);
+    for (const auto& frame : frames) assert(frame.data[5] == 1);
+    frames.clear(); ascii("#LOCALCOMP 7 0 0 0 0 0", usb);
+    assert(usb.output.find("error") == 0 && frames.empty());
+    frames.clear(); ascii("#LOCALCOMP 2 0 4000 0 0 0", usb);
+    assert(usb.output.find("error") == 0 && frames.empty());
+    frames.clear(); ascii("#LOCALCOMP 1 0 77 24 0 500", usb);
+    assert(frames.size() == 5);
+    int32_t j1Deadzone = 0;
+    memcpy(&j1Deadzone, frames[3].data.data(), 4);
+    assert(j1Deadzone == DummyRobot::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[1]);
+
     frames.clear(); dummy.DragTick(1);
     assert(frames.size() == 6);
     for (const auto& frame : frames)
         assert(frame.header.StdId == ((frame.header.StdId >> 7) << 7 | 0x0B) &&
                std::isfinite(value(frame, 0)) && std::isfinite(value(frame, 4)));
-    // REST pose must also be compensated: J2 motor negative, J3 motor positive.
+    // REST pose must also be compensated: J2/J3/J5 motor positive or negative
+    // according to each motor's inverseDirection mapping.
     assert(value(frames[1], 0) < -0.1f && value(frames[2], 0) > 0.1f);
+    assert(value(frames[4], 0) > 0.05f && value(frames[4], 0) < 0.2f);
     frames.clear(); dummy.DragTick(20);
     unsigned dragFrames = 0, feedbackRequests = 0;
     for (const auto& frame : frames)
@@ -194,6 +225,7 @@ int main() {
     assert(frames.size() == 6);
     for (const auto& frame : frames) assert((frame.header.StdId & 0x7f) == 0x0A);
     assert(value(frames[1], 0) > 0 && value(frames[2], 0) > 0);
+    assert(value(frames[4], 0) > 0.05f && value(frames[4], 0) < 0.2f);
     ascii("#GRAVITY_FF_OFF", usb);
     frames.clear(); dummy.UpdateGravityFeedForward(8);
     assert(frames.size() == 6);

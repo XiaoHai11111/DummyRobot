@@ -18,6 +18,7 @@ cxx=${CXX:-g++}
 "$cxx" -std=c++17 -O2 -I6.Tests/firmware/stubs -I"$f4/Robot" -I"$f4/Bsp/communication" \
   6.Tests/firmware/test_f4.cpp "$f4/Robot/instances/dummy_robot.cpp" \
   "$f4/Robot/actuators/ctrl_step/ctrl_step.cpp" "$f4/Robot/algorithms/kinematic/6dof_kinematic.cpp" \
+  "$f4/Robot/algorithms/gravity_compensation/gravity_compensation.cpp" \
   "$f4/UserApp/protocols/can_protocol.cpp" "$f4/UserApp/protocols/ascii_protocol.cpp" \
   "$f4/Bsp/communication/ascii_processor.cpp" -o "$build_dir/f4"
 "$build_dir/f4"
@@ -28,6 +29,7 @@ python3 6.Tests/firmware/test_f1_codegen.py
   6.Tests/firmware/test_usb_pipeline.cpp "$f4/Bsp/communication/interface_usb.cpp" \
   "$f4/Robot/instances/dummy_robot.cpp" "$f4/Robot/actuators/ctrl_step/ctrl_step.cpp" \
   "$f4/Robot/algorithms/kinematic/6dof_kinematic.cpp" \
+  "$f4/Robot/algorithms/gravity_compensation/gravity_compensation.cpp" \
   "$f4/UserApp/protocols/ascii_protocol.cpp" "$f4/Bsp/communication/ascii_processor.cpp" -o "$build_dir/usb"
 "$build_dir/usb"
 "${CC:-cc}" -std=gnu11 -O2 -Wall -Wextra -Werror -fno-pie -no-pie \

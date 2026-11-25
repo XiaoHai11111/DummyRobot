@@ -55,7 +55,7 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
 
     // Reject short frames before touching payload; inquiries/hold/clear have no arguments.
     if (((_cmd >= 0x01 && _cmd <= 0x07 && _cmd != 0x02) && _len < 4) ||
-        ((_cmd == 0x06 || _cmd == 0x07 || _cmd == 0x0A || _cmd == 0x0B) && _len < 8) ||
+        ((_cmd == 0x06 || _cmd == 0x07 || _cmd == 0x0A || _cmd == 0x0B || _cmd == 0x0C) && _len < 8) ||
         ((_cmd >= 0x11 && _cmd <= 0x1B) && _len < 5))
         return;
     if ((_cmd >= 0x03 && _cmd <= 0x07) || _cmd == 0x0A || _cmd == 0x0B ||
@@ -158,6 +158,10 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             motor.controller->RequestDragCurrent(
                 ReadValue<float>(_data), ReadValue<uint16_t>(_data + 4),
                 ReadValue<uint16_t>(_data + 6));
+            break;
+        case 0x0C: // Set one local compensation parameter; byte 5 requests EEPROM storage.
+            motor.controller->SetLocalCompensationParam(
+                _data[4], ReadValue<int32_t>(_data), _data[5] != 0);
             break;
 
             // 0x10~0x1F CMDs with Memory

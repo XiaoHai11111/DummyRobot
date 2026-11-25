@@ -2,6 +2,7 @@
 #include "Motor/control_math.h"
 #include "Motor/control_timing.h"
 #include <climits>
+#include <limits>
 #include "configurations.h"
 #include <cassert>
 #include <iostream>
@@ -112,7 +113,8 @@ int main() {
     motor.controller->SetCtrlMode(Motor::MODE_COMMAND_CURRENT);
     motor.controller->SetCurrentSetPoint(1000);
     ticks(motor, 12000);
-    for (int n = 0; n < 1000; ++n) { ++encoder.angleData.rectifiedAngle; motor.Tick20kHz(); }
+    // A real motion period above the stall-speed threshold breaks continuity.
+    for (int n = 0; n < 1000; ++n) { encoder.angleData.rectifiedAngle += 32; motor.Tick20kHz(); }
     ticks(motor, 12000);
     assert(!motor.controller->isStalled);
     ticks(motor, 10000);
@@ -150,6 +152,21 @@ int main() {
     assert(ffMotor.controller->GetFeedForwardCurrent_mA() == 0);
     assert(ffDriver.current == 0);
 
+    // Stage 2 parameters use F1 BoardConfig units and reject invalid indices/values.
+    assert(ffMotor.controller->SetLocalCompensationParam(0, 100));
+    assert(ffMotor.controller->SetLocalCompensationParam(1, 200));
+    assert(ffMotor.controller->SetLocalCompensationParam(2, 300));
+    assert(ffMotor.controller->SetLocalCompensationParam(3, 10));
+    assert(ffMotor.controller->SetLocalCompensationParam(4, 800));
+    assert(!ffMotor.controller->SetLocalCompensationParam(5, 100));
+    assert(!ffMotor.controller->SetLocalCompensationParam(0, -100));
+    assert(!ffMotor.controller->SetLocalCompensationParam(4, 4000));
+    assert(ffMotor.controller->SetLocalCompensationParam(4, 800, true));
+    assert(boardConfig.localCompLimit_mA == 800);
+    assert(boardConfig.version == BOARD_CONFIG_VERSION);
+    assert(boardConfig.configStatus == CONFIG_COMMIT);
+    boardConfig.configStatus = CONFIG_OK;
+
     // Drag current is leased; expiry returns to position hold.
     assert(ffMotor.controller->RequestDragCurrent(0.3f, 1, 500));
     ticks(ffMotor, 4000); // Current mode switch and 2 mA/ms current ramp.
@@ -165,6 +182,70 @@ int main() {
     ticks(ffMotor, 4000);
     assert(ffMotor.controller->modeRunning == Motor::MODE_COMMAND_CURRENT);
     assert(ffDriver.current == 300);
+
+    // Stage 2 local compensation uses F1 velocity and only acts during a lease.
+    // One encoder step per tick is below the clamped deadzone and must be ignored.
+    for (int i = 0; i < 200; ++i)
+    {
+        ++encoder.angleData.rectifiedAngle;
+        ffMotor.Tick20kHz();
+    }
+    assert(ffDriver.current == 300);
+
+    // Above the deadzone the fitted correction is applied.
+    for (int i = 0; i < 200; ++i)
+    {
+        encoder.angleData.rectifiedAngle += 4;
+        ffMotor.Tick20kHz();
+    }
+    assert(ffDriver.current > 300);
+
+    // A deadzone above the measured speed disables the correction.
+    assert(ffMotor.controller->SetLocalCompensationParam(3, 100000));
+    for (int i = 0; i < 200; ++i)
+    {
+        encoder.angleData.rectifiedAngle += 4;
+        ffMotor.Tick20kHz();
+    }
+    assert(ffDriver.current == 300);
+
+    // The correction itself is clamped and never exceeds the motor current limit.
+    // A requested deadzone of 10 is clamped to the safe minimum.
+    assert(ffMotor.controller->SetLocalCompensationParam(3, 10));
+    assert(ffMotor.controller->config->localComp.deadzoneSteps ==
+           Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000 * 51200 / 1000);
+    assert(ffMotor.controller->SetLocalCompensationParam(0, 1000000));
+    assert(ffMotor.controller->SetLocalCompensationParam(4, 500));
+    for (int i = 0; i < 200; ++i)
+    {
+        encoder.angleData.rectifiedAngle += 4;
+        ffMotor.Tick20kHz();
+    }
+    assert(ffDriver.current == -200);
+
+    // Without a drag lease, the same nonzero parameters must not change current mode.
+    Motor plainCurrentMotor;
+    Driver plainCurrentDriver;
+    encoder.angleData.rectifiedAngle = 0;
+    plainCurrentMotor.AttachEncoder(&encoder);
+    plainCurrentMotor.AttachDriver(&plainCurrentDriver);
+    plainCurrentMotor.controller->Init();
+    encoder.calibrated = true;
+    plainCurrentMotor.config.motionParams.ratedCurrent = 3000;
+    plainCurrentMotor.Tick20kHz();
+    plainCurrentMotor.controller->SetEnable(true);
+    ticks(plainCurrentMotor, 3);
+    plainCurrentMotor.controller->SetCtrlMode(Motor::MODE_COMMAND_CURRENT);
+    plainCurrentMotor.controller->SetCurrentSetPoint(300);
+    ticks(plainCurrentMotor, 4000);
+    plainCurrentMotor.controller->SetLocalCompensationParam(1, 500);
+    plainCurrentMotor.controller->SetLocalCompensationParam(4, 500);
+    for (int i = 0; i < 200; ++i)
+    {
+        ++encoder.angleData.rectifiedAngle;
+        plainCurrentMotor.Tick20kHz();
+    }
+    assert(plainCurrentDriver.current == 300);
 
     std::cout << "F1 controller fault, hold, feed-forward and drag tests passed\n";
 }

@@ -336,6 +336,21 @@ void CtrlStepMotor::UpdateAngleCallback(float _pos, bool _isFinished)
     angle = inverseDirection ? -tmp : tmp;
 }
 
+uint32_t CtrlStepMotor::VelocityAge() const
+{
+    const uint32_t receivedAt = velocityTick;
+    return HAL_GetTick() - receivedAt;
+}
+
+
+float CtrlStepMotor::GetVelocityDegS() const
+{
+    const float turnsPerSecond = velocityTurnsPerSecond;
+    const float deg = turnsPerSecond * 360.0f / static_cast<float>(reduction);
+    return inverseDirection ? -deg : deg;
+}
+
+
 uint32_t CtrlStepMotor::FeedbackAge() const
 {
     // Read the ISR-owned timestamp BEFORE the clock. A CAN interrupt between
@@ -455,7 +470,7 @@ void CtrlStepMotor::SetDceKp(int32_t _val)
     auto* b = (unsigned char*) &_val;
     for (int i = 0; i < 4; i++)
         canBuf[i] = *(b + i);
-    canBuf[4] = 1; // Need save to EEPROM or not
+    canBuf[4] = 1;
 
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
@@ -471,7 +486,7 @@ void CtrlStepMotor::SetDceKv(int32_t _val)
     auto* b = (unsigned char*) &_val;
     for (int i = 0; i < 4; i++)
         canBuf[i] = *(b + i);
-    canBuf[4] = 1; // Need save to EEPROM or not
+    canBuf[4] = 1;
 
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
@@ -487,7 +502,7 @@ void CtrlStepMotor::SetDceKi(int32_t _val)
     auto* b = (unsigned char*) &_val;
     for (int i = 0; i < 4; i++)
         canBuf[i] = *(b + i);
-    canBuf[4] = 1; // Need save to EEPROM or not
+    canBuf[4] = 1;
 
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
@@ -503,7 +518,36 @@ void CtrlStepMotor::SetDceKd(int32_t _val)
     auto* b = (unsigned char*) &_val;
     for (int i = 0; i < 4; i++)
         canBuf[i] = *(b + i);
-    canBuf[4] = 1; // Need save to EEPROM or not
+    canBuf[4] = 1;
 
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+}
+
+
+static void SendLocalCompensationParam(CAN_HandleTypeDef* hcan, const CAN_TxHeaderTypeDef& baseHeader,
+                                       uint8_t nodeID, uint8_t index, int32_t value,
+                                       bool storeToEeprom)
+{
+    uint8_t canBuf[8] = {};
+    CAN_TxHeaderTypeDef txHeader = baseHeader;
+    txHeader.StdId = nodeID << 7 | 0x0C;
+
+    auto* b = reinterpret_cast<unsigned char*>(&value);
+    for (int i = 0; i < 4; i++) canBuf[i] = *(b + i);
+    canBuf[4] = index;
+    canBuf[5] = storeToEeprom ? 1 : 0;
+
+    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+}
+
+
+void CtrlStepMotor::SetLocalCompensation(int32_t damping, int32_t coulomb,
+                                         int32_t viscous, int32_t deadzone, int32_t limit,
+                                         bool storeToEeprom)
+{
+    SendLocalCompensationParam(hcan, baseHeader, nodeID, 0, damping, storeToEeprom);
+    SendLocalCompensationParam(hcan, baseHeader, nodeID, 1, coulomb, storeToEeprom);
+    SendLocalCompensationParam(hcan, baseHeader, nodeID, 2, viscous, storeToEeprom);
+    SendLocalCompensationParam(hcan, baseHeader, nodeID, 3, deadzone, storeToEeprom);
+    SendLocalCompensationParam(hcan, baseHeader, nodeID, 4, limit, storeToEeprom);
 }

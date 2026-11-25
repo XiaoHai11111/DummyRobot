@@ -57,6 +57,9 @@ public:
     void SetDceKv(int32_t _val);
     void SetDceKi(int32_t _val);
     void SetDceKd(int32_t _val);
+    void SetLocalCompensation(int32_t damping, int32_t coulomb,
+                              int32_t viscous, int32_t deadzone, int32_t limit,
+                              bool storeToEeprom = false);
     void ApplyPositionAsHome();
     void SetEnableOnBoot(bool _enable);
     void SetEnableStallProtect(bool _enable);
@@ -67,17 +70,8 @@ public:
     void UpdateAngleCallback(float _pos, bool _isFinished);
     void UpdateStatus(uint8_t _state, uint8_t _faults, bool _supported);
     uint32_t FeedbackAge() const;
-    uint32_t VelocityAge() const
-    {
-        const uint32_t receivedAt = velocityTick;
-        return HAL_GetTick() - receivedAt;
-    }
-    float GetVelocityDegS() const
-    {
-        const float turnsPerSecond = velocityTurnsPerSecond;
-        const float deg = turnsPerSecond * 360.0f / static_cast<float>(reduction);
-        return inverseDirection ? -deg : deg;
-    }
+    uint32_t VelocityAge() const;
+    float GetVelocityDegS() const;
     bool ClearFaults();
     bool ReadControlTiming();
     void UpdateControlTiming(uint16_t last, uint16_t peak, uint32_t overruns);

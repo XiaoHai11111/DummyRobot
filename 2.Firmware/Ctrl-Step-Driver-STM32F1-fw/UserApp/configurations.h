@@ -15,6 +15,8 @@ typedef enum configStatus_t
     CONFIG_COMMIT
 } configStatus_t;
 
+#define BOARD_CONFIG_VERSION 2U
+
 
 typedef struct Config_t
 {
@@ -32,6 +34,12 @@ typedef struct Config_t
     int32_t dce_kd;
     bool enableMotorOnBoot;
     bool enableStallProtect;
+    int32_t localDamping_mA_per_motorRevS;
+    int32_t localCoulomb_mA;
+    int32_t localViscous_mA_per_motorRevS;
+    int32_t localDeadzone_motorRevS_x1000;
+    int32_t localCompLimit_mA;
+    uint32_t version;
 } BoardConfig_t;
 
 extern BoardConfig_t boardConfig;

@@ -2,7 +2,7 @@
 #include "dummy_robot.h"
 #include "motion_command.h"
 
-inline float AbsMaxOf6(DOF6Kinematic::Joint6D_t _joints, uint8_t &_index)
+static float AbsMaxOf6(DOF6Kinematic::Joint6D_t _joints, uint8_t &_index)
 {
     float max = -1;
     for (uint8_t i = 0; i < 6; i++)
@@ -15,6 +15,29 @@ inline float AbsMaxOf6(DOF6Kinematic::Joint6D_t _joints, uint8_t &_index)
     }
 
     return max;
+}
+
+
+DummyRobot::Config_t::Config_t()
+{
+    controlFrequencyHz = 200;
+    gravityFeedForwardHz = 50;
+    feedForwardLeaseMs = 100;
+    dragFeedbackHz = 10;
+    dragLeaseMs = 200;
+    dragVelocityValidMs = 250;
+    dragVelocityFilterAlpha = 0.2f;
+    dragVelocitySmoothingDegS = 2.0f;
+    dragVelocityCutoffDegS = 30.0f;
+    dragEndStopMarginDeg = 2.0f;
+    dragDamping = 0.0f;
+    dragFrictionAlpha = 0.0f;
+    dragCurrentLimit = 1.0f;
+    dragDampingMax = 0.2f;
+    dragFrictionAlphaMax = 1.0f;
+    dragCurrentLimitMin = 0.1f;
+    dragCurrentLimitMax = 1.5f;
+    gravityFeedForwardEnabled = false;
 }
 
 
@@ -508,40 +531,74 @@ static uint16_t NextSequence(uint16_t& sequence)
 }
 
 
+void DummyRobot::SetGravityFeedForwardEnabled(bool _enabled)
+{
+    config.gravityFeedForwardEnabled = _enabled;
+}
+
+
+bool DummyRobot::IsGravityFeedForwardEnabled() const
+{
+    return config.gravityFeedForwardEnabled;
+}
+
+
+uint16_t DummyRobot::GetFeedForwardSequence() const
+{
+    return feedForwardSequence;
+}
+
+
+uint16_t DummyRobot::GetDragSequence() const
+{
+    return dragSequence;
+}
+
+
 void DummyRobot::SetDragGains(float _damping, float _frictionAlpha, float _currentLimit)
 {
     if (!std::isfinite(_damping) || !std::isfinite(_frictionAlpha) ||
         !std::isfinite(_currentLimit) ||
-        _damping < 0 || _damping > 0.2f ||
-        _frictionAlpha < 0 || _frictionAlpha > 1 ||
-        _currentLimit < 0.1f || _currentLimit > 1.5f)
+        _damping < 0 || _damping > config.dragDampingMax ||
+        _frictionAlpha < 0 || _frictionAlpha > config.dragFrictionAlphaMax ||
+        _currentLimit < config.dragCurrentLimitMin || _currentLimit > config.dragCurrentLimitMax)
         return;
-    dragDamping = _damping;
-    dragFrictionAlpha = _frictionAlpha;
-    dragCurrentLimit = _currentLimit;
+    config.dragDamping = _damping;
+    config.dragFrictionAlpha = _frictionAlpha;
+    config.dragCurrentLimit = _currentLimit;
 }
 
 
 void DummyRobot::GetDragGains(float* _gains) const
 {
-    _gains[0] = dragDamping;
-    _gains[1] = dragFrictionAlpha;
-    _gains[2] = dragCurrentLimit;
+    _gains[0] = config.dragDamping;
+    _gains[1] = config.dragFrictionAlpha;
+    _gains[2] = config.dragCurrentLimit;
+}
+
+
+static uint32_t ControlIntervalTicks(uint32_t controlFrequencyHz, uint32_t taskFrequencyHz)
+{
+    if (controlFrequencyHz == 0 || taskFrequencyHz == 0 || controlFrequencyHz < taskFrequencyHz)
+        return 0;
+    return controlFrequencyHz / taskFrequencyHz;
 }
 
 
 void DummyRobot::UpdateGravityFeedForward(uint32_t tick)
 {
-    if (tick % 4) return; // 50 Hz from the 200 Hz control task.
+    const uint32_t intervalTicks = ControlIntervalTicks(config.controlFrequencyHz,
+                                                        config.gravityFeedForwardHz);
+    if (intervalTicks == 0 || tick % intervalTicks) return;
     const uint16_t sequence = NextSequence(feedForwardSequence);
     float gravityCurrentA[7]{};
-    if (gravityFeedForwardEnabled && IsEnabled() && !HasFault())
+    if (config.gravityFeedForwardEnabled && IsEnabled() && !HasFault())
         gravityModel.CalculateGravityCurrentA(currentJoints.a, gravityCurrentA);
     for (unsigned j = 1; j <= 6; ++j)
     {
         const float jointCurrentA = gravityCurrentA[j];
         const float motorCurrentA = motorJ[j]->inverseDirection ? -jointCurrentA : jointCurrentA;
-        motorJ[j]->SetCurrentFeedForward(motorCurrentA, sequence, 100);
+        motorJ[j]->SetCurrentFeedForward(motorCurrentA, sequence, config.feedForwardLeaseMs);
     }
 }
 
@@ -553,7 +610,9 @@ void DummyRobot::DragTick(uint32_t tick)
         motorJ[ALL]->Hold();
         return;
     }
-    if (tick % 20 == 0)
+    const uint32_t feedbackIntervalTicks = ControlIntervalTicks(config.controlFrequencyHz,
+                                                                config.dragFeedbackHz);
+    if (feedbackIntervalTicks && tick % feedbackIntervalTicks == 0)
     {
         for (unsigned j = 1; j <= 6; ++j)
         {
@@ -567,28 +626,31 @@ void DummyRobot::DragTick(uint32_t tick)
     gravityModel.CalculateGravityCurrentA(currentJoints.a, gravityCurrentA);
     for (unsigned j = 1; j <= 6; ++j)
     {
-        const float measuredVelocity = motorJ[j]->VelocityAge() < 250 ?
+        const float measuredVelocity = motorJ[j]->VelocityAge() < config.dragVelocityValidMs ?
                                        motorJ[j]->GetVelocityDegS() : 0;
-        dragVelocityFiltered[j] += 0.2f * (measuredVelocity - dragVelocityFiltered[j]);
+        dragVelocityFiltered[j] += config.dragVelocityFilterAlpha *
+                                   (measuredVelocity - dragVelocityFiltered[j]);
         const float velocity = dragVelocityFiltered[j];
         float jointCurrentA = gravityCurrentA[j];
         const float loss = gravityModel.FrictionLossA(j, velocity);
-        const float smoothSign = velocity / (fabsf(velocity) + 2.0f);
-        jointCurrentA += dragFrictionAlpha * smoothSign * loss - dragDamping * velocity;
+        const float smoothSign = velocity /
+                                 (fabsf(velocity) + config.dragVelocitySmoothingDegS);
+        jointCurrentA += config.dragFrictionAlpha * smoothSign * loss -
+                         config.dragDamping * velocity;
 
         const float q = currentJoints.a[j - 1];
         const float maxAngle = motorJ[j]->angleLimitMax;
         const float minAngle = motorJ[j]->angleLimitMin;
-        if (q >= maxAngle - 2 && jointCurrentA > 0) jointCurrentA = 0;
-        if (q <= minAngle + 2 && jointCurrentA < 0) jointCurrentA = 0;
-        if (fabsf(velocity) > 30 &&
+        if (q >= maxAngle - config.dragEndStopMarginDeg && jointCurrentA > 0) jointCurrentA = 0;
+        if (q <= minAngle + config.dragEndStopMarginDeg && jointCurrentA < 0) jointCurrentA = 0;
+        if (fabsf(velocity) > config.dragVelocityCutoffDegS &&
             ((velocity > 0 && jointCurrentA > 0) || (velocity < 0 && jointCurrentA < 0)))
             jointCurrentA = 0;
 
-        jointCurrentA = GravityCompensation::Model::Clamp(jointCurrentA, dragCurrentLimit);
+        jointCurrentA = GravityCompensation::Model::Clamp(jointCurrentA, config.dragCurrentLimit);
         const float motorCurrentA = motorJ[j]->inverseDirection ?
                                     -jointCurrentA : jointCurrentA;
-        motorJ[j]->SetDragCurrent(motorCurrentA, sequence, 200);
+        motorJ[j]->SetDragCurrent(motorCurrentA, sequence, config.dragLeaseMs);
     }
 }
 

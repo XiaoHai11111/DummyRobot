@@ -39,6 +39,12 @@ Timer::Timer(TIM_HandleTypeDef *_htim, uint32_t _freqHz)
     }
 }
 
+uint32_t Timer::GetFrequencyHz() const
+{
+    return freq;
+}
+
+
 void Timer::Start()
 {
     HAL_TIM_Base_Start_IT(htim);

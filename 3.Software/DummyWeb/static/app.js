@@ -68,6 +68,7 @@ function commandNeedsConfirmation(command) {
     || /^!START$/.test(normalized)
     || /^#GRIP(?:\s|_CURRENT\s)/.test(normalized)
     || /^#CMDMODE\s/.test(normalized)
+    || /^#LOCALCOMP\s/.test(normalized)
     || normalized === '!CLEARFAULT';
 }
 
