@@ -129,6 +129,36 @@ static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
     {
         dummy.SetGravityFeedForwardEnabled(false);
         Respond(response, "Gravity feed-forward disabled");
+    } else if (text.rfind("#GRAVITY ", 0) == 0)
+    {
+        unsigned joint;
+        float scale;
+        char extra;
+        if (sscanf(cmd, "#GRAVITY %u %f %c", &joint, &scale, &extra) != 2 ||
+            joint < 1 || joint > 6 || !MotionFinite(scale) ||
+            scale < 0 || scale > 1)
+            Respond(response, "error invalid gravity (J1..J6, scale 0..1)");
+        else if (dummy.SetGravity(joint, scale))
+            Respond(response, "okg %u gravity %.3f", joint, scale);
+        else
+            Respond(response, "error gravity rejected");
+    } else if (text.rfind("#GRAVITY_MODEL ", 0) == 0)
+    {
+        unsigned joint;
+        float aPerNm, biasA, limitA;
+        char extra;
+        if (sscanf(cmd, "#GRAVITY_MODEL %u %f %f %f %c",
+                   &joint, &aPerNm, &biasA, &limitA, &extra) != 4 ||
+            joint < 1 || joint > 6 || !MotionFinite(aPerNm) ||
+            !MotionFinite(biasA) || !MotionFinite(limitA) ||
+            fabsf(aPerNm) > 10 || biasA < -1 || biasA > 1 ||
+            limitA <= 0 || limitA > 3.3f)
+            Respond(response, "error invalid gravity model (J1..J6)");
+        else if (dummy.SetGravityModel(joint, aPerNm, biasA, limitA))
+            Respond(response, "okg %u gravity-model %.6f %.6f %.3f",
+                    joint, aPerNm, biasA, limitA);
+        else
+            Respond(response, "error gravity model rejected");
     } else if (text.rfind("#DRAG_GAIN ", 0) == 0)
     {
         float damping, frictionAlpha, currentLimit;
@@ -163,12 +193,25 @@ static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
             const int32_t appliedDeadzone =
                 deadzone < DummyRobot::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[joint] ?
                 DummyRobot::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[joint] : deadzone;
-            dummy.motorJ[joint]->SetLocalCompensation(damping, coulomb, viscous,
-                                                       appliedDeadzone, limit,
-                                                       fields == 7 && store == 1);
-            Respond(response, "Local compensation J%u %d %d %d %d %d%s",
-                    joint, damping, coulomb, viscous, appliedDeadzone, limit,
-                    fields == 7 && store == 1 ? " stored" : "");
+            const bool sent = dummy.motorJ[joint]->SetLocalCompensation(
+                damping, coulomb, viscous, appliedDeadzone, limit,
+                fields == 7 && store == 1);
+            if (!sent)
+            {
+                dummy.SetEnable(false);
+                Respond(response, "error local compensation CAN send failed");
+            }
+            else
+            {
+                if (joint == 4 || joint == 5)
+                {
+                    dummy.SetWristLocalLimit(joint, limit);
+                    dummy.SetDragLocalLimit(joint, limit);
+                }
+                Respond(response, "Local compensation J%u %d %d %d %d %d%s",
+                        joint, damping, coulomb, viscous, appliedDeadzone, limit,
+                        fields == 7 && store == 1 ? " stored" : "");
+            }
         }
     } else if (text == "#GETDRAG")
     {
@@ -179,6 +222,185 @@ static void OnRobotAsciiCmd(const char* cmd, size_t len, StreamSink &response)
                 dummy.IsGravityFeedForwardEnabled() ? 1 : 0,
                 gains[0], gains[1], gains[2],
                 dummy.GetFeedForwardSequence(), dummy.GetDragSequence());
+    } else if (text == "#SETALLPARAMS")
+    {
+        Respond(response, dummy.SetAllJointParams() ?
+                "okall joint params stored" :
+                "error set all joint params rejected: disable robot first");
+    } else if (text.rfind("#GETCOMP ", 0) == 0)
+    {
+        unsigned joint;
+        char extra;
+        if (sscanf(cmd, "#GETCOMP %u %c", &joint, &extra) != 1 || joint < 1 || joint > 6)
+            Respond(response, "error invalid joint (1..6)");
+        else if (!dummy.motorJ[joint]->RefreshCompensationParams())
+            Respond(response, "error compensation inquiry timeout");
+        else
+            Respond(response,
+                    "okcomp %u local %d %d %d %d %d harm %d %d %d %d",
+                    joint,
+                    dummy.motorJ[joint]->ReadLocalDamping(),
+                    dummy.motorJ[joint]->ReadLocalCoulomb(),
+                    dummy.motorJ[joint]->ReadLocalViscous(),
+                    dummy.motorJ[joint]->ReadLocalDeadzone(),
+                    dummy.motorJ[joint]->ReadLocalLimit(),
+                    dummy.motorJ[joint]->ReadHarmonicESin(),
+                    dummy.motorJ[joint]->ReadHarmonicECos(),
+                    dummy.motorJ[joint]->ReadHarmonicOSin(),
+                    dummy.motorJ[joint]->ReadHarmonicOCos());
+    } else if (text.rfind("#SETCOMP ", 0) == 0)
+    {
+        unsigned joint, store;
+        int32_t damping, coulomb, viscous, deadzone, limit;
+        int32_t eSin, eCos, oSin, oCos;
+        char extra;
+        const int fields = sscanf(cmd,
+                                  "#SETCOMP %u %d %d %d %d %d %u "
+                                  "%d %d %d %d %c",
+                                  &joint, &damping, &coulomb, &viscous,
+                                  &deadzone, &limit, &store,
+                                  &eSin, &eCos, &oSin, &oCos, &extra);
+        const int32_t local[5] = {damping, coulomb, viscous, deadzone, limit};
+        if (fields != 11 || store > 1 || joint < 1 || joint > 6)
+            Respond(response, "error invalid compensation command");
+        else if (!dummy.SetLocalCompensation(joint, local, store == 1) ||
+                 ((joint == 4 || joint == 5) &&
+                  !dummy.SetWristHarmonicsStored(joint, eSin, eCos, oSin, oCos)))
+            Respond(response, "error compensation rejected");
+        else
+        {
+            if (joint == 4 || joint == 5)
+            {
+                dummy.SetWristLocalLimit(joint, limit);
+                dummy.SetDragLocalLimit(joint, limit);
+                dummy.wrist[joint].dragFrictionScale = damping > 0 ? 0.3f : 0.0f;
+                const int16_t harmonics[4] = {
+                    static_cast<int16_t>(eSin), static_cast<int16_t>(eCos),
+                    static_cast<int16_t>(oSin), static_cast<int16_t>(oCos)};
+                memcpy(dummy.wrist[joint].dragHarmonicMa, harmonics,
+                       sizeof(dummy.wrist[joint].dragHarmonicMa));
+            }
+            Respond(response, "okcomp %u configured%s", joint, store == 1 ? " stored" : "");
+        }
+    } else if (text.rfind("#WRIST_GRAVITY ", 0) == 0)
+    {
+        unsigned joint;
+        float scale;
+        char extra;
+        if (sscanf(cmd, "#WRIST_GRAVITY %u %f %c", &joint, &scale, &extra) != 2 ||
+            joint < 4 || joint > 5 || !MotionFinite(scale) || scale < 0 || scale > 1)
+            Respond(response, "error invalid wrist gravity (J4/J5, scale 0..1)");
+        else if (dummy.SetWristGravity(joint, scale))
+            Respond(response, "okw %u gravity %.3f", joint, scale);
+        else
+            Respond(response, "error wrist gravity rejected");
+    } else if (text.rfind("#WRIST_GRAVITY_MODEL ", 0) == 0)
+    {
+        unsigned joint;
+        float aPerNm, biasA, limitA;
+        char extra;
+        if (sscanf(cmd, "#WRIST_GRAVITY_MODEL %u %f %f %f %c",
+                   &joint, &aPerNm, &biasA, &limitA, &extra) != 4 ||
+            joint < 4 || joint > 5 || !MotionFinite(aPerNm) ||
+            !MotionFinite(biasA) || !MotionFinite(limitA) ||
+            aPerNm < 0 || aPerNm > 10 || biasA < -1 || biasA > 1 ||
+            limitA <= 0 || limitA > 3.3f)
+            Respond(response, "error invalid wrist gravity model");
+        else if (dummy.SetWristGravityModel(joint, aPerNm, biasA, limitA))
+            Respond(response, "okw %u gravity-model %.6f %.6f %.3f",
+                    joint, aPerNm, biasA, limitA);
+        else
+            Respond(response, "error wrist gravity model rejected");
+    } else if (text.rfind("#WRIST_HARMONIC ", 0) == 0)
+    {
+        unsigned joint;
+        int32_t eSin, eCos, oSin, oCos;
+        char extra;
+        if (sscanf(cmd, "#WRIST_HARMONIC %u %d %d %d %d %c",
+                   &joint, &eSin, &eCos, &oSin, &oCos, &extra) != 5 ||
+            joint < 4 || joint > 5 ||
+            eSin < -500 || eSin > 500 || eCos < -500 || eCos > 500 ||
+            oSin < -500 || oSin > 500 || oCos < -500 || oCos > 500)
+            Respond(response, "error invalid wrist harmonics (mA, each +/-500)");
+        else if (dummy.SetWristHarmonics(joint, eSin, eCos, oSin, oCos))
+            Respond(response, "okw %u harmonic %ld %ld %ld %ld", joint,
+                    static_cast<long>(eSin), static_cast<long>(eCos),
+                    static_cast<long>(oSin), static_cast<long>(oCos));
+        else
+            Respond(response, "error wrist harmonics rejected while moving");
+    } else if (text.rfind("#WRIST_SPEED ", 0) == 0)
+    {
+        unsigned joint, enable;
+        char extra;
+        if (sscanf(cmd, "#WRIST_SPEED %u %u %c", &joint, &enable, &extra) != 2 ||
+            joint < 4 || joint > 5 || enable > 1)
+            Respond(response, "error invalid wrist speed (J4/J5, enable 0/1)");
+        else if (dummy.SetWristSpeed(joint, enable == 1))
+            Respond(response, "okw %u speed %u", joint, enable);
+        else
+            Respond(response, "error wrist protocol/readback timeout; compensation remains off");
+    } else if (text.rfind("#WRIST_FRICTION ", 0) == 0)
+    {
+        unsigned joint;
+        float scale;
+        int32_t limit;
+        char extra;
+        if (sscanf(cmd, "#WRIST_FRICTION %u %f %d %c", &joint, &scale, &limit, &extra) != 3 ||
+            joint < 4 || joint > 5 || !MotionFinite(scale) || scale < 0 || scale > 1 ||
+            limit < 1 || limit > 500)
+            Respond(response, "error invalid wrist friction (J4/J5, scale 0..1, limit 1..500)");
+        else if (!dummy.SetWristLocalLimit(joint, limit))
+            Respond(response, "error invalid wrist local limit");
+        else if (dummy.SetWristFriction(joint, scale))
+            Respond(response, "okw %u friction %.3f limit %ld", joint, scale,
+                    static_cast<long>(limit));
+        else
+            Respond(response, "error wrist protocol/readback timeout; compensation remains off");
+    } else if (text.rfind("#GETWRIST ", 0) == 0)
+    {
+        unsigned joint;
+        char extra;
+        if (sscanf(cmd, "#GETWRIST %u %c", &joint, &extra) != 1 || joint < 4 || joint > 5)
+            Respond(response, "error invalid wrist joint (4/5)");
+        else if (!dummy.RefreshWristStatus(joint))
+            Respond(response, "error wrist inquiry timeout (requires new F1 protocol)");
+        else
+        {
+            const auto& wrist = dummy.GetWristConfig(joint);
+            const auto& gravityModel = dummy.gravityModel.GetJointGravityModel(joint);
+            Respond(response, "okw %u g%.3f gm%.6f,%.6f,%.3f f%.3f fs%.3f "
+                    "s%u flags%u dir%d current%d seq%u harm%d,%d,%d,%d",
+                    joint, wrist.gravityRequested ? wrist.gravityScale : 0.0f,
+                    gravityModel.currentPerNm, gravityModel.biasA, gravityModel.limitA,
+                    wrist.frictionEnabled ? wrist.frictionScale : 0.0f,
+                    wrist.frictionScale,
+                    unsigned(wrist.speedEnabled), unsigned(wrist.statusFlags),
+                    int(wrist.direction), int(wrist.actualAssistMa), unsigned(wrist.statusSequence),
+                    int(wrist.harmonicReadbackMa[0]), int(wrist.harmonicReadbackMa[1]),
+                    int(wrist.harmonicReadbackMa[2]), int(wrist.harmonicReadbackMa[3]));
+        }
+    } else if (text == "#WRIST_RESET" || text.rfind("#WRIST_RESET ", 0) == 0)
+    {
+        unsigned joint = 0;
+        char extra;
+        const int fields = sscanf(cmd, "#WRIST_RESET %u %c", &joint, &extra);
+        if (fields != EOF && fields != 1)
+            Respond(response, "error invalid wrist reset (optional J4/J5)");
+        else if (joint == 0)
+        {
+            if (dummy.ResetWristCompensation(4) &&
+                dummy.ResetWristCompensation(5))
+                Respond(response, "okw reset 4 5 gravity and local RAM opt-in off");
+            else
+                Respond(response, "error wrist reset not confirmed; assist remains off");
+        } else if (joint >= 4 && joint <= 5)
+        {
+            if (dummy.ResetWristCompensation(joint))
+                Respond(response, "okw reset %u gravity and local RAM opt-in off", joint);
+            else
+                Respond(response, "error wrist reset not confirmed; assist remains off");
+        } else
+            Respond(response, "error invalid wrist joint (4/5)");
     } else if (text.rfind("#GRIP", 0) == 0)
     {
         float value;

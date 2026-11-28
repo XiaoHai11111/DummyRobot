@@ -33,16 +33,23 @@ namespace GravityCompensation
             float viscousAPerDegS;
         };
 
+        // One gravity model instance per robot joint. Axes with no measurable
+        // gravity contribution use zero coefficients instead of being absent.
+        struct JointGravityModel
+        {
+            float currentPerNm;
+            float biasA;
+            float limitA;
+            float sinCoeffA;
+            float cosCoeffA;
+            float scale;
+        };
+
         struct Config_t
         {
             JointGeometry joints[6];
             float modelOffsetDeg[6];
-            float currentPerNm[6];
-            float currentBiasA[6];
-            float joint5SinCoeffA;
-            float joint5CosCoeffA;
-            float joint5BiasA;
-            float joint5MaxCurrentA;
+            JointGravityModel gravity[6];
             FrictionModel friction[6];
             float gravityMS2;
 
@@ -60,8 +67,17 @@ namespace GravityCompensation
         static Mat3 RotationZ(float radians);
         static float Clamp(float value, float limit);
 
+        void CalculateGravityTorqueNm(const float q[6], float torqueNm[7]) const;
         void CalculateGravityCurrentA(const float q[6], float currentA[7]) const;
+        float CalculateCalibratedJointCurrentA(uint8_t joint, const float q[6]) const;
         float GravityJointA(uint8_t joint, const float q[6]) const;
         float FrictionLossA(uint8_t joint, float velocityDegS) const;
+        const JointGravityModel& GetJointGravityModel(uint8_t joint) const;
+        bool SetJointGravityModel(uint8_t joint, float currentPerNm,
+                                  float biasA, float limitA);
+        bool SetJointGravityHarmonics(uint8_t joint, float sinCoeffA,
+                                      float cosCoeffA);
+        bool SetJointGravityScale(uint8_t joint, float scale);
+        void ResetJointGravityModel(uint8_t joint);
     };
 }

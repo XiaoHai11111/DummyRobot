@@ -53,6 +53,14 @@ DummyRobot::DummyRobot(CAN_HandleTypeDef* _hcan) :
     motorJ[6] = new CtrlStepMotor(_hcan, 6, true, 50, -720, 720);
     hand = new DummyHand(_hcan, 7);
 
+    for (unsigned j = 4; j <= 5; ++j)
+    {
+        WristAxisConfig_t& state = wrist[j];
+        const unsigned index = j - 4;
+        memcpy(state.harmonicBaseMa, WRIST_BASE_HARMONIC_MA[index],
+               sizeof(state.harmonicBaseMa));
+    }
+
     dof6Solver = new DOF6Kinematic(0.114f, 0.035f, 0.146f, 0.123f, 0.052f, 0.151f);
 }
 
@@ -350,7 +358,8 @@ void DummyRobot::SetEnable(bool _enable)
         isEnabled = false;
         holdOnStop = false;
         commandHandler.ClearFifo();
-        motorJ[ALL]->SetEnable(false);
+        if (!motorJ[ALL]->SetEnable(false)) motorJ[ALL]->Hold();
+        DisableWristCompensationNow();
     }
 }
 
@@ -402,7 +411,9 @@ void DummyRobot::StopMotion()
     commandHandler.ClearFifo();
     targetJoints = currentJoints;
     // Each driver uses its own measured position, not a potentially stale F4 angle.
-    motorJ[ALL]->Hold();
+    if (!motorJ[ALL]->Hold())
+        for (unsigned j = 1; j <= 6; ++j) motorJ[j]->Hold();
+    SuspendWristCompensationNow();
 }
 
 bool DummyRobot::ClearFaults()
@@ -517,9 +528,46 @@ void DummyRobot::SetCommandMode(uint32_t _mode)
             break;
         case COMMAND_DRAG:
             for (float& velocity : dragVelocityFiltered) velocity = 0;
+            if (!leavingDrag && !isEnabled && !recovering)
+            {
+                for (unsigned joint = 4; joint <= 5; ++joint)
+                {
+                    WristAxisConfig_t& state = wrist[joint];
+                    state.dragAutoEnabled = false;
+                    state.dragLocalLimitMa = state.frictionLimitMa;
+                    state.dragFrictionScale = state.frictionScale;
+                    memcpy(state.dragHarmonicMa, state.harmonicBaseMa,
+                           sizeof(state.dragHarmonicMa));
+                    if (state.dragLocalLimitMa <= 0)
+                        state.dragLocalLimitMa = 55;
+                    if (state.dragFrictionScale <= 0)
+                        state.dragFrictionScale = 0.3f;
+                    state.frictionLimitMa = state.dragLocalLimitMa;
+                    state.frictionScale = state.dragFrictionScale;
+                    state.frictionRequested = true;
+                    state.speedRequested = true;
+                    if (!motorJ[joint]->SetHarmonicCompensation(
+                            state.dragHarmonicMa, false) ||
+                        !ApplyWristCompensation(joint, true))
+                    {
+                        state.dragAutoEnabled = false;
+                        state.frictionRequested = false;
+                        state.speedRequested = false;
+                        DisableWristCompensationNow();
+                    } else
+                    {
+                        state.dragAutoEnabled = true;
+                    }
+                }
+            }
             break;
     }
-    if (leavingDrag) motorJ[ALL]->Hold();
+    if (leavingDrag)
+    {
+        if (!motorJ[ALL]->Hold())
+            for (unsigned j = 1; j <= 6; ++j) motorJ[j]->Hold();
+        SuspendWristCompensationNow();
+    }
 }
 
 
@@ -557,8 +605,8 @@ uint16_t DummyRobot::GetDragSequence() const
 
 void DummyRobot::SetDragGains(float _damping, float _frictionAlpha, float _currentLimit)
 {
-    if (!std::isfinite(_damping) || !std::isfinite(_frictionAlpha) ||
-        !std::isfinite(_currentLimit) ||
+    if (!MotionFinite(_damping) || !MotionFinite(_frictionAlpha) ||
+        !MotionFinite(_currentLimit) ||
         _damping < 0 || _damping > config.dragDampingMax ||
         _frictionAlpha < 0 || _frictionAlpha > config.dragFrictionAlphaMax ||
         _currentLimit < config.dragCurrentLimitMin || _currentLimit > config.dragCurrentLimitMax)
@@ -577,6 +625,618 @@ void DummyRobot::GetDragGains(float* _gains) const
 }
 
 
+uint16_t DummyRobot::NextWristSequence()
+{
+    ++wristSequence;
+    if (wristSequence == 0) wristSequence = 1;
+    return wristSequence;
+}
+
+
+static bool IsWristJoint(uint32_t joint)
+{
+    return joint == 4 || joint == 5;
+}
+
+
+static uint8_t WristGainPercent(float scale)
+{
+    const long percent = lroundf(scale * 100.0f);
+    if (percent < 0) return 0;
+    if (percent > 100) return 100;
+    return static_cast<uint8_t>(percent);
+}
+
+
+bool DummyRobot::SetWristGravity(uint32_t joint, float scale)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering || !MotionFinite(scale) ||
+        scale < 0 || scale > 1)
+        return false;
+    WristAxisConfig_t& state = wrist[joint];
+    state.gravityScale = scale;
+    state.gravityRequested = scale > 0;
+    return SetGravity(joint, scale);
+}
+
+
+bool DummyRobot::SetWristGravityModel(uint32_t joint, float aPerNm,
+                                      float biasA, float limitA)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering ||
+        !MotionFinite(aPerNm) || !MotionFinite(biasA) || !MotionFinite(limitA))
+        return false;
+    if (!SetGravityModel(joint, aPerNm, biasA, limitA)) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    state.gravityAPerNm = aPerNm;
+    state.gravityBiasA = biasA;
+    state.gravityLimitA = limitA;
+    return true;
+}
+
+
+bool DummyRobot::SetGravityModel(uint32_t joint, float aPerNm,
+                                 float biasA, float limitA)
+{
+    if (joint < 1 || joint > 6 || isEnabled || recovering ||
+        !MotionFinite(aPerNm) || !MotionFinite(biasA) || !MotionFinite(limitA))
+        return false;
+    return gravityModel.SetJointGravityModel(joint, aPerNm, biasA, limitA);
+}
+
+
+bool DummyRobot::SetGravity(uint32_t joint, float scale)
+{
+    if (joint < 1 || joint > 6 || isEnabled || recovering ||
+        !MotionFinite(scale) || scale < 0 || scale > 1)
+        return false;
+    return gravityModel.SetJointGravityScale(joint, scale);
+}
+
+
+bool DummyRobot::SetWristHarmonics(uint32_t joint, int32_t eSin, int32_t eCos,
+                                   int32_t oSin, int32_t oCos)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering) return false;
+    const int32_t values[4] = {eSin, eCos, oSin, oCos};
+    for (int32_t value : values)
+        if (value < -500 || value > 500) return false;
+    const int16_t valuesMa[4] = {
+        static_cast<int16_t>(eSin), static_cast<int16_t>(eCos),
+        static_cast<int16_t>(oSin), static_cast<int16_t>(oCos)};
+    if (!motorJ[joint]->SetHarmonicCompensation(valuesMa, false)) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    memcpy(state.harmonicBaseMa, valuesMa, sizeof(state.harmonicBaseMa));
+    memcpy(state.harmonicMa, valuesMa, sizeof(state.harmonicMa));
+    state.harmonicVerified = true;
+    return true;
+}
+
+
+bool DummyRobot::SetWristHarmonicsStored(uint32_t joint, int32_t eSin, int32_t eCos,
+                                         int32_t oSin, int32_t oCos)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering) return false;
+    const int32_t inputs[4] = {eSin, eCos, oSin, oCos};
+    for (int32_t value : inputs)
+        if (value < -500 || value > 500) return false;
+    const int16_t valuesMa[4] = {
+        static_cast<int16_t>(eSin), static_cast<int16_t>(eCos),
+        static_cast<int16_t>(oSin), static_cast<int16_t>(oCos)};
+    const bool storeToEeprom = true;
+    if (!motorJ[joint]->SetHarmonicCompensation(valuesMa, storeToEeprom)) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    memcpy(state.harmonicBaseMa, valuesMa, sizeof(state.harmonicBaseMa));
+    memcpy(state.harmonicMa, valuesMa, sizeof(state.harmonicMa));
+    state.harmonicVerified = true;
+    return true;
+}
+
+
+bool DummyRobot::SetLocalCompensation(uint32_t joint, const int32_t values[5],
+                                      bool storeToEeprom)
+{
+    if (joint < 1 || joint > 6 || isEnabled || recovering || !values) return false;
+    if (values[0] < 0 || values[0] > 1000000 ||
+        values[1] < 0 || values[1] > 3300 ||
+        values[2] < 0 || values[2] > 1000000 ||
+        values[3] < LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000[joint] ||
+        values[3] > 1000000 ||
+        values[4] < 0 || values[4] > 3300)
+        return false;
+    return motorJ[joint]->SetLocalCompensation(
+        values[0], values[1], values[2], values[3], values[4], storeToEeprom);
+}
+
+
+bool DummyRobot::SetAllJointParams()
+{
+    if (isEnabled || recovering) return false;
+
+    for (uint32_t joint = 1; joint <= 6; ++joint)
+    {
+        CtrlStepMotor* motor = motorJ[joint];
+
+        motor->SetDceKp(DCE_KP[joint]);
+        motor->SetDceKv(DCE_KV[joint]);
+        motor->SetDceKi(DCE_KI[joint]);
+        motor->SetDceKd(DCE_KD[joint]);
+
+        if (!motor->SetLocalCompensation(LOCAL_COMP[joint][0],
+                                         LOCAL_COMP[joint][1],
+                                         LOCAL_COMP[joint][2],
+                                         LOCAL_COMP[joint][3],
+                                         LOCAL_COMP[joint][4],
+                                         true))
+            return false;
+
+        const int16_t* harmonics = ALL_HARMONICS_MA[joint];
+        if (IsWristJoint(joint) &&
+            !motor->SetHarmonicCompensation(harmonics, true))
+            return false;
+
+        if (!IsWristJoint(joint)) continue;
+
+        WristAxisConfig_t& state = wrist[joint];
+        memcpy(state.harmonicBaseMa, harmonics, sizeof(state.harmonicBaseMa));
+        memcpy(state.harmonicMa, harmonics, sizeof(state.harmonicMa));
+        memcpy(state.dragHarmonicMa, harmonics, sizeof(state.dragHarmonicMa));
+        state.harmonicVerified = true;
+        state.frictionLimitMa = LOCAL_COMP[joint][4];
+        state.frictionScale = LOCAL_COMP[joint][1] > 0 ? 0.3f : 0.0f;
+        state.dragLocalLimitMa = state.frictionLimitMa;
+        state.dragFrictionScale = state.frictionScale;
+    }
+
+    return true;
+}
+
+
+bool DummyRobot::SetWristLocalLimit(uint32_t joint, int32_t limitMa)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering ||
+        limitMa < 0 || limitMa > 500)
+        return false;
+    wrist[joint].frictionLimitMa = limitMa;
+    return true;
+}
+
+
+void DummyRobot::SetDragLocalLimit(uint32_t joint, int32_t limitMa)
+{
+    if (!IsWristJoint(joint)) return;
+    wrist[joint].dragLocalLimitMa = limitMa < 0 ? 0 : (limitMa > 500 ? 500 : limitMa);
+}
+
+
+float DummyRobot::CalculateWristGravityCurrentA(uint8_t joint) const
+{
+    if (!IsWristJoint(joint)) return 0;
+    return gravityModel.CalculateCalibratedJointCurrentA(joint, currentJoints.a);
+}
+
+
+bool DummyRobot::ConfirmWristStatus(unsigned joint, uint16_t expectedSequence,
+                                    bool expectedEnabled)
+{
+    WristAxisConfig_t& state = wrist[joint];
+    CtrlStepMotor::WristCompensationStatus status{};
+    bool acknowledged = false;
+    for (unsigned attempt = 0; attempt < 3; ++attempt)
+    {
+        if (!motorJ[joint]->QueryWristCompensationStatus(status)) break;
+        state.protocolVerified = true;
+        if (status.sequence == expectedSequence &&
+            ((status.flags & 1U) != 0) == expectedEnabled)
+        {
+            acknowledged = true;
+            break;
+        }
+    }
+    if (!acknowledged) return false;
+
+    state.statusFlags = status.flags;
+    state.direction = status.direction;
+    state.actualAssistMa = status.actualAssistMa;
+    state.statusSequence = status.sequence;
+    state.statusTick = HAL_GetTick();
+    state.speedEnabled = (status.flags & 1U) != 0;
+    state.frictionEnabled =
+        state.speedEnabled && state.requestedSequence == status.sequence &&
+        state.frictionRequested && state.appliedGainPercent > 0 &&
+        state.appliedCapMa > 0 && (status.flags & 2U) != 0;
+    state.controlVerified = true;
+    state.safeOffVerified = state.appliedGainPercent == 0 &&
+                            state.appliedCapMa == 0;
+    return true;
+}
+
+
+bool DummyRobot::SendWristControl(unsigned joint, bool assistEnabled,
+                                  bool keepSpeedMeasurement, bool verify)
+{
+    if (!IsWristJoint(joint)) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    const bool enable = assistEnabled || keepSpeedMeasurement;
+    const uint8_t gainPercent = assistEnabled && state.frictionRequested ?
+                                WristGainPercent(state.frictionScale) : 0;
+    const uint16_t capMa = assistEnabled && state.frictionRequested ?
+                           static_cast<uint16_t>(state.frictionLimitMa) : 0;
+    const uint16_t sequence = NextWristSequence();
+    state.requestedSequence = sequence;
+    state.controlVerified = false;
+    state.safeOffVerified = false;
+    state.appliedGainPercent = gainPercent;
+    state.appliedCapMa = capMa;
+
+    if (!motorJ[joint]->SetWristCompensation(enable, gainPercent, capMa, sequence))
+    {
+        motorJ[joint]->Hold();
+        state.speedEnabled = false;
+        state.frictionEnabled = false;
+        return false;
+    }
+    if (enable)
+    {
+        state.speedEnabled = true;
+        state.frictionEnabled = assistEnabled;
+    }
+    else
+    {
+        state.speedEnabled = false;
+        state.frictionEnabled = false;
+    }
+    if (!verify)
+    {
+        state.safeOffVerified = gainPercent == 0 && capMa == 0;
+        return true;
+    }
+    if (ConfirmWristStatus(joint, sequence, enable)) return true;
+
+    // The write may have reached the board even though its acknowledgement did
+    // not. Supersede it with an unacknowledged zero-assist frame, then HOLD
+    // locally so neither this axis nor a later action can reuse the old lease.
+    const uint16_t rollbackSequence = NextWristSequence();
+    state.requestedSequence = rollbackSequence;
+    state.appliedGainPercent = 0;
+    state.appliedCapMa = 0;
+    motorJ[joint]->SetWristCompensation(false, 0, 0, rollbackSequence);
+    motorJ[joint]->Hold();
+    state.controlVerified = false;
+    state.safeOffVerified = false;
+    state.speedEnabled = false;
+    state.frictionEnabled = false;
+    return false;
+}
+
+
+bool DummyRobot::ApplyWristCompensation(unsigned joint, bool enable)
+{
+    if (!IsWristJoint(joint) || enable && (isEnabled || recovering)) return false;
+    auto* motor = motorJ[joint];
+    WristAxisConfig_t& state = wrist[joint];
+    state.oldProtocol = false;
+    state.harmonicVerified = false;
+    state.controlVerified = false;
+    state.safeOffVerified = false;
+    state.speedEnabled = false;
+    state.frictionEnabled = false;
+
+    // Establish both halves of the v2 handshake before sending any assist
+    // configuration. Old firmware must never be followed by a 0x0E opt-in.
+    int16_t existing[4]{};
+    if (!motor->QueryHarmonicCompensation(existing))
+    {
+        state.oldProtocol = true;
+        state.protocolVerified = false;
+        motor->Hold();
+        return false;
+    }
+
+    CtrlStepMotor::WristCompensationStatus status{};
+    if (!motor->QueryWristCompensationStatus(status))
+    {
+        state.oldProtocol = true;
+        state.protocolVerified = false;
+        motor->Hold();
+        return false;
+    }
+    state.protocolVerified = true;
+
+    // If another producer currently owns the board, first prove a zero-gain
+    // speed-only state before touching RAM parameters.
+    if ((status.flags & 1U) &&
+        !SendWristControl(joint, false, false, true))
+        return false;
+
+    if (enable && state.frictionRequested)
+    {
+        if (state.frictionLimitMa <= 0)
+        {
+            SendWristControl(joint, false, false, true);
+            return false;
+        }
+        const int16_t* target = state.harmonicBaseMa;
+        if (!motor->SetHarmonicCompensation(target))
+        {
+            SendWristControl(joint, false, false, true);
+            return false;
+        }
+        int16_t readback[4]{};
+        if (!motor->QueryHarmonicCompensation(readback) ||
+            memcmp(readback, target, sizeof(state.harmonicBaseMa)) != 0)
+        {
+            SendWristControl(joint, false, false, true);
+            return false;
+        }
+        memcpy(state.harmonicMa, target, sizeof(state.harmonicBaseMa));
+        memcpy(state.harmonicReadbackMa, readback, sizeof(readback));
+        state.harmonicVerified = true;
+    }
+
+    const bool assist = enable && state.frictionRequested;
+    const bool keepSpeed = enable && state.speedRequested;
+    if (!SendWristControl(joint, assist, keepSpeed, true))
+        return false;
+    return enable ? state.controlVerified : state.safeOffVerified;
+}
+
+
+bool DummyRobot::SetWristSpeed(uint32_t joint, bool enable)
+{
+    if (!IsWristJoint(joint)) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    if (!enable)
+    {
+        if (!SendWristControl(joint, false, false, true)) return false;
+        state.speedRequested = false;
+        state.frictionRequested = false;
+        state.speedEnabled = false;
+        state.frictionEnabled = false;
+        state.controlVerified = false;
+        state.safeOffVerified = true;
+        return true;
+    }
+    if (isEnabled || recovering) return false;
+    state.speedRequested = true;
+    const bool applied = ApplyWristCompensation(joint, true);
+    if (!applied) state.controlVerified = false;
+    return applied;
+}
+
+
+bool DummyRobot::SetWristFriction(uint32_t joint, float scale)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering || !MotionFinite(scale) ||
+        scale < 0 || scale > 1)
+        return false;
+    WristAxisConfig_t& state = wrist[joint];
+    state.frictionScale = scale;
+    state.frictionRequested = scale > 0;
+    state.speedRequested = true;
+    const bool applied = ApplyWristCompensation(joint, true);
+    if (!applied) state.controlVerified = false;
+    return applied;
+}
+
+
+bool DummyRobot::RefreshWristStatus(uint32_t joint)
+{
+    if (!IsWristJoint(joint)) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    int16_t values[4]{};
+    if (!motorJ[joint]->QueryHarmonicCompensation(values)) return false;
+    UpdateWristHarmonicReadback(joint, values);
+    CtrlStepMotor::WristCompensationStatus status{};
+    if (!motorJ[joint]->QueryWristCompensationStatus(status)) return false;
+    state.protocolVerified = true;
+    state.statusFlags = status.flags;
+    state.direction = status.direction;
+    state.actualAssistMa = status.actualAssistMa;
+    state.statusSequence = status.sequence;
+    state.statusTick = HAL_GetTick();
+    const bool unexpectedEnable = (status.flags & 1U) && !state.speedRequested;
+    if (unexpectedEnable || status.sequence != state.requestedSequence)
+    {
+        if (!SendWristControl(joint, false, false, true)) return false;
+        state.speedEnabled = false;
+        state.frictionEnabled = false;
+        return true;
+    }
+    state.speedEnabled = (status.flags & 1U) != 0;
+    state.frictionEnabled =
+        state.speedEnabled && state.frictionRequested &&
+        state.appliedGainPercent > 0 && state.appliedCapMa > 0 &&
+        (status.flags & 2U);
+    state.controlVerified = true;
+    state.safeOffVerified = state.appliedGainPercent == 0 &&
+                            state.appliedCapMa == 0;
+    return state.speedEnabled || state.safeOffVerified;
+}
+
+
+bool DummyRobot::ResetWristCompensation(uint32_t joint)
+{
+    if (!IsWristJoint(joint) || isEnabled || recovering) return false;
+    WristAxisConfig_t& state = wrist[joint];
+    if (!SendWristControl(joint, false, false, true)) return false;
+    state.gravityRequested = false;
+    state.gravityScale = 0;
+    state.frictionRequested = false;
+    state.frictionScale = 1;
+    state.frictionLimitMa = 0;
+    state.speedRequested = false;
+    state.speedEnabled = false;
+    state.frictionEnabled = false;
+    state.protocolVerified = false;
+    state.controlVerified = false;
+    state.safeOffVerified = true;
+    state.harmonicVerified = false;
+    state.oldProtocol = false;
+    state.appliedGainPercent = 0;
+    state.appliedCapMa = 0;
+    state.requestedSequence = 0;
+    state.statusSequence = 0;
+    state.statusFlags = 0;
+    state.direction = 0;
+    state.actualAssistMa = 0;
+    state.statusTick = 0;
+    const unsigned index = joint - 4;
+    gravityModel.ResetJointGravityModel(joint);
+    memcpy(state.harmonicBaseMa, WRIST_BASE_HARMONIC_MA[index],
+           sizeof(state.harmonicBaseMa));
+    return true;
+}
+
+
+void DummyRobot::ClearWristRuntimeState(unsigned joint, bool clearConfiguration)
+{
+    WristAxisConfig_t& state = wrist[joint];
+    state.speedEnabled = false;
+    state.frictionEnabled = false;
+    state.controlVerified = false;
+    state.safeOffVerified = false;
+    state.harmonicVerified = false;
+    state.requestedSequence = 0;
+    state.statusSequence = 0;
+    state.statusFlags = 0;
+    state.actualAssistMa = 0;
+    state.direction = 0;
+    state.statusTick = 0;
+    state.appliedGainPercent = 0;
+    state.appliedCapMa = 0;
+    if (clearConfiguration)
+    {
+        state.speedRequested = false;
+        state.frictionRequested = false;
+        state.protocolVerified = false;
+        state.oldProtocol = false;
+    }
+}
+
+
+void DummyRobot::SuspendWristCompensationNow()
+{
+    for (unsigned joint = 4; joint <= 5; ++joint)
+    {
+        WristAxisConfig_t& state = wrist[joint];
+        if (!state.speedRequested && !state.protocolVerified &&
+            state.safeOffVerified)
+            continue;
+        const bool keepSpeed = state.speedRequested && state.protocolVerified;
+        if (!SendWristControl(joint, false, keepSpeed, false))
+            motorJ[joint]->Hold();
+        state.frictionEnabled = false;
+        state.controlVerified = false;
+        state.safeOffVerified = false;
+    }
+}
+
+
+void DummyRobot::DisableWristCompensationNow()
+{
+    for (unsigned joint = 4; joint <= 5; ++joint)
+    {
+        WristAxisConfig_t& state = wrist[joint];
+        if (!state.speedRequested && !state.protocolVerified &&
+            state.safeOffVerified)
+            continue;
+        if (!SendWristControl(joint, false, false, true))
+        {
+            motorJ[joint]->Hold();
+            // Keep the axis on the v2 path until a fresh handshake confirms
+            // safe-off. Falling back to 0x0B could revive a stale old lease.
+            state.speedRequested = true;
+            state.protocolVerified = false;
+            state.controlVerified = false;
+            state.safeOffVerified = false;
+            state.speedEnabled = false;
+            state.frictionEnabled = false;
+            continue;
+        }
+        ClearWristRuntimeState(joint, true);
+    }
+}
+
+
+void DummyRobot::UpdateWristHarmonicReadback(unsigned joint, const int16_t valuesMa[4])
+{
+    if (!IsWristJoint(joint) || !valuesMa) return;
+    memcpy(wrist[joint].harmonicReadbackMa, valuesMa,
+           sizeof(wrist[joint].harmonicReadbackMa));
+}
+
+
+void DummyRobot::UpdateWristCompensationStatus(unsigned joint, uint8_t flags, int8_t direction,
+                                               int16_t actualAssistMa, uint16_t sequence)
+{
+    if (!IsWristJoint(joint)) return;
+    WristAxisConfig_t& state = wrist[joint];
+    state.statusFlags = flags;
+    state.direction = direction;
+    state.actualAssistMa = actualAssistMa;
+    state.statusSequence = sequence;
+    state.statusTick = HAL_GetTick();
+    if (sequence == state.requestedSequence)
+    {
+        state.speedEnabled = (flags & 1U) != 0;
+        state.frictionEnabled =
+            state.speedEnabled && state.frictionRequested &&
+            state.appliedGainPercent > 0 && state.appliedCapMa > 0 &&
+            (flags & 2U);
+        state.controlVerified = true;
+        state.safeOffVerified = state.appliedGainPercent == 0 &&
+                                state.appliedCapMa == 0;
+        if (!state.speedEnabled)
+        {
+            state.frictionEnabled = false;
+        }
+    }
+    else
+    {
+        state.controlVerified = false;
+        state.safeOffVerified = false;
+        state.speedEnabled = false;
+        state.frictionEnabled = false;
+    }
+}
+
+
+void DummyRobot::PollWristStatus(uint32_t tick)
+{
+    bool resyncRequired = false;
+    for (unsigned joint = 4; joint <= 5; ++joint)
+        resyncRequired |= wrist[joint].speedRequested && !wrist[joint].controlVerified;
+    if (tick % 10U && !resyncRequired) return;
+    const uint32_t now = HAL_GetTick();
+    for (unsigned joint = 4; joint <= 5; ++joint)
+    {
+        WristAxisConfig_t& state = wrist[joint];
+        if (!state.protocolVerified && !state.speedRequested) continue;
+        if (!motorJ[joint]->RequestWristCompensationStatus())
+        {
+            motorJ[joint]->Hold();
+            state.controlVerified = false;
+            state.safeOffVerified = false;
+            state.protocolVerified = false;
+            state.speedEnabled = false;
+            state.frictionEnabled = false;
+            continue;
+        }
+        if (state.statusTick &&
+            now - state.statusTick > config.dragVelocityValidMs)
+        {
+            if (!SendWristControl(joint, false, state.speedRequested, true))
+            {
+                motorJ[joint]->Hold();
+                state.protocolVerified = false;
+            }
+            state.frictionEnabled = false;
+        }
+    }
+}
+
+
 static uint32_t ControlIntervalTicks(uint32_t controlFrequencyHz, uint32_t taskFrequencyHz)
 {
     if (controlFrequencyHz == 0 || taskFrequencyHz == 0 || controlFrequencyHz < taskFrequencyHz)
@@ -590,15 +1250,34 @@ void DummyRobot::UpdateGravityFeedForward(uint32_t tick)
     const uint32_t intervalTicks = ControlIntervalTicks(config.controlFrequencyHz,
                                                         config.gravityFeedForwardHz);
     if (intervalTicks == 0 || tick % intervalTicks) return;
+    PollWristStatus(tick);
     const uint16_t sequence = NextSequence(feedForwardSequence);
     float gravityCurrentA[7]{};
-    if (config.gravityFeedForwardEnabled && IsEnabled() && !HasFault())
+    if (IsEnabled() && !HasFault())
+    {
         gravityModel.CalculateGravityCurrentA(currentJoints.a, gravityCurrentA);
+    }
     for (unsigned j = 1; j <= 6; ++j)
     {
-        const float jointCurrentA = gravityCurrentA[j];
+        float jointCurrentA = 0;
+        if (config.gravityFeedForwardEnabled)
+        {
+            jointCurrentA = gravityCurrentA[j];
+            if ((j == 4 || j == 5) && wrist[j].gravityRequested)
+            {
+                const float wristCurrentA = CalculateWristGravityCurrentA(j);
+                jointCurrentA +=
+                    (wristCurrentA - jointCurrentA) * wrist[j].gravityScale;
+            }
+        }
+        jointCurrentA = GravityCompensation::Model::Clamp(jointCurrentA, 3.3f);
         const float motorCurrentA = motorJ[j]->inverseDirection ? -jointCurrentA : jointCurrentA;
-        motorJ[j]->SetCurrentFeedForward(motorCurrentA, sequence, config.feedForwardLeaseMs);
+        if (!motorJ[j]->SetCurrentFeedForward(
+                motorCurrentA, sequence, config.feedForwardLeaseMs))
+        {
+            StopMotion();
+            return;
+        }
     }
 }
 
@@ -612,6 +1291,7 @@ void DummyRobot::DragTick(uint32_t tick)
     }
     const uint32_t feedbackIntervalTicks = ControlIntervalTicks(config.controlFrequencyHz,
                                                                 config.dragFeedbackHz);
+    PollWristStatus(tick);
     if (feedbackIntervalTicks && tick % feedbackIntervalTicks == 0)
     {
         for (unsigned j = 1; j <= 6; ++j)
@@ -624,6 +1304,11 @@ void DummyRobot::DragTick(uint32_t tick)
     const uint16_t sequence = NextSequence(dragSequence);
     float gravityCurrentA[7]{};
     gravityModel.CalculateGravityCurrentA(currentJoints.a, gravityCurrentA);
+    const long configuredLimitMa = lroundf(config.dragCurrentLimit * 1000.0f);
+    const uint16_t totalLimitMa = static_cast<uint16_t>(
+        configuredLimitMa < 1 ? 1 : configuredLimitMa > 3300 ? 3300 :
+        configuredLimitMa);
+    bool safetyFailure = false;
     for (unsigned j = 1; j <= 6; ++j)
     {
         const float measuredVelocity = motorJ[j]->VelocityAge() < config.dragVelocityValidMs ?
@@ -632,26 +1317,75 @@ void DummyRobot::DragTick(uint32_t tick)
                                    (measuredVelocity - dragVelocityFiltered[j]);
         const float velocity = dragVelocityFiltered[j];
         float jointCurrentA = gravityCurrentA[j];
-        const float loss = gravityModel.FrictionLossA(j, velocity);
-        const float smoothSign = velocity /
-                                 (fabsf(velocity) + config.dragVelocitySmoothingDegS);
-        jointCurrentA += config.dragFrictionAlpha * smoothSign * loss -
-                         config.dragDamping * velocity;
+        if ((j == 4 || j == 5) && wrist[j].gravityRequested)
+        {
+            const float wristCurrentA = CalculateWristGravityCurrentA(j);
+            jointCurrentA +=
+                (wristCurrentA - jointCurrentA) * wrist[j].gravityScale;
+        }
+        const bool localFrictionOwnsAxis =
+            (j == 4 || j == 5) &&
+            (wrist[j].speedRequested || wrist[j].speedEnabled);
+        if (!localFrictionOwnsAxis)
+        {
+            const float loss = gravityModel.FrictionLossA(j, velocity);
+            const float smoothSign = velocity /
+                                     (fabsf(velocity) + config.dragVelocitySmoothingDegS);
+            jointCurrentA += config.dragFrictionAlpha * smoothSign * loss -
+                             config.dragDamping * velocity;
+        }
 
         const float q = currentJoints.a[j - 1];
         const float maxAngle = motorJ[j]->angleLimitMax;
         const float minAngle = motorJ[j]->angleLimitMin;
-        if (q >= maxAngle - config.dragEndStopMarginDeg && jointCurrentA > 0) jointCurrentA = 0;
-        if (q <= minAngle + config.dragEndStopMarginDeg && jointCurrentA < 0) jointCurrentA = 0;
-        if (fabsf(velocity) > config.dragVelocityCutoffDegS &&
-            ((velocity > 0 && jointCurrentA > 0) || (velocity < 0 && jointCurrentA < 0)))
-            jointCurrentA = 0;
+        const bool overPositive = velocity > config.dragVelocityCutoffDegS;
+        const bool overNegative = velocity < -config.dragVelocityCutoffDegS;
+        const bool disableJointPositive =
+            q >= maxAngle - config.dragEndStopMarginDeg || overPositive;
+        const bool disableJointNegative =
+            q <= minAngle + config.dragEndStopMarginDeg || overNegative;
+        if (disableJointPositive && jointCurrentA > 0) jointCurrentA = 0;
+        if (disableJointNegative && jointCurrentA < 0) jointCurrentA = 0;
 
-        jointCurrentA = GravityCompensation::Model::Clamp(jointCurrentA, config.dragCurrentLimit);
+        jointCurrentA = GravityCompensation::Model::Clamp(
+            jointCurrentA, config.dragCurrentLimit);
         const float motorCurrentA = motorJ[j]->inverseDirection ?
                                     -jointCurrentA : jointCurrentA;
-        motorJ[j]->SetDragCurrent(motorCurrentA, sequence, config.dragLeaseMs);
+        if ((j == 4 || j == 5) && wrist[j].speedRequested)
+        {
+            if (!wrist[j].protocolVerified || !wrist[j].controlVerified ||
+                !wrist[j].speedEnabled)
+            {
+                motorJ[j]->Hold();
+                safetyFailure = true;
+                break;
+            }
+            const long motorMaLong = lroundf(motorCurrentA * 1000.0f);
+            const int16_t motorMa = static_cast<int16_t>(
+                motorMaLong < -3300 ? -3300 : motorMaLong > 3300 ? 3300 :
+                motorMaLong);
+            bool disablePositiveMotor = disableJointPositive;
+            bool disableNegativeMotor = disableJointNegative;
+            if (motorJ[j]->inverseDirection)
+                std::swap(disablePositiveMotor, disableNegativeMotor);
+            if (!motorJ[j]->SetExtendedDragCurrent(
+                    motorMa, totalLimitMa, sequence, config.dragLeaseMs,
+                    disablePositiveMotor, disableNegativeMotor))
+            {
+                motorJ[j]->Hold();
+                safetyFailure = true;
+                break;
+            }
+        }
+        else if (!motorJ[j]->SetDragCurrent(
+                     motorCurrentA, sequence, config.dragLeaseMs))
+        {
+            motorJ[j]->Hold();
+            safetyFailure = true;
+            break;
+        }
     }
+    if (safetyFailure) StopMotion();
 }
 
 

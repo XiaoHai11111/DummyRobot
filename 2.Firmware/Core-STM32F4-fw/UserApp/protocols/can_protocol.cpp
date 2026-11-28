@@ -3,10 +3,16 @@
 
 extern DummyRobot dummy;
 
+static int16_t ReadInt16LittleEndian(const uint8_t* data)
+{
+    return static_cast<int16_t>(static_cast<uint16_t>(data[0]) |
+                                (static_cast<uint16_t>(data[1]) << 8));
+}
+
 void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data)
 {
     // Common CAN message callback, uses ID 32~0x7FF.
-    if (canCtx->handle->Instance == CAN1)
+    if (canCtx && canCtx->handle && canCtx->handle->Instance == CAN1)
     {
         uint8_t id = rxHeader->StdId >> 7; // 4Bits ID & 7Bits Msg
         uint8_t cmd = rxHeader->StdId & 0x7F; // 4Bits ID & 7Bits Msg
@@ -60,11 +66,57 @@ void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* d
                 dummy.motorJ[id]->UpdateControlTiming(last, peak, overruns);
                 break;
             }
+            case 0x28:
+            {
+                if (rxHeader->IDE != CAN_ID_STD || rxHeader->RTR != CAN_RTR_DATA ||
+                    (id != 4 && id != 5) || rxHeader->DLC != 8)
+                    return;
+                int16_t values[4]{};
+                for (unsigned i = 0; i < 4; ++i)
+                {
+                    values[i] = ReadInt16LittleEndian(data + i * 2);
+                    if (values[i] < -500 || values[i] > 500) return;
+                }
+                dummy.UpdateWristHarmonicReadback(id, values);
+                dummy.motorJ[id]->UpdateHarmonicCompensationReadback(values);
+                break;
+            }
+            case 0x29:
+            case 0x2A:
+            case 0x2B:
+            case 0x2C:
+            {
+                if (rxHeader->IDE != CAN_ID_STD || rxHeader->RTR != CAN_RTR_DATA ||
+                    id < 1 || id > 6 || rxHeader->DLC != 8)
+                    return;
+                dummy.motorJ[id]->UpdateCompensationParams(cmd - 0x29, data);
+                break;
+            }
+            case 0x27:
+            {
+                if (rxHeader->IDE != CAN_ID_STD || rxHeader->RTR != CAN_RTR_DATA ||
+                    (id != 4 && id != 5) || rxHeader->DLC != 8 ||
+                    data[0] != 0xB4 || data[1] != 2 || (data[2] & ~3U) != 0)
+                    return;
+                const int8_t direction = static_cast<int8_t>(data[3]);
+                const int16_t actualAssistMa = ReadInt16LittleEndian(data + 4);
+                if (direction < -1 || direction > 1 ||
+                    actualAssistMa < -3300 || actualAssistMa > 3300)
+                    return;
+                const uint16_t sequence = static_cast<uint16_t>(
+                    static_cast<uint16_t>(data[6]) |
+                    (static_cast<uint16_t>(data[7]) << 8));
+                dummy.motorJ[id]->UpdateWristCompensationStatus(
+                    data[2], direction, actualAssistMa, sequence);
+                dummy.UpdateWristCompensationStatus(
+                    id, data[2], direction, actualAssistMa, sequence);
+                break;
+            }
             default:
                 break;
         }
 
-    } else if (canCtx->handle->Instance == CAN2)
+    } else if (canCtx && canCtx->handle && canCtx->handle->Instance == CAN2)
     {
         /*----------------------- ↓ Add Your CAN2 Packet Protocol Here ↓ ------------------------*/
     }

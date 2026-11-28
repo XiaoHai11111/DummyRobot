@@ -30,28 +30,14 @@ namespace GravityCompensation
         modelOffsetDeg[4] = 0;
         modelOffsetDeg[5] = 0;
 
-        // Joint-positive current per generalized gravity torque (A/Nm),
-        // calibrated against the four recorded fixed-pose J2/J3 runs.
-        currentPerNm[0] = 0;
-        currentPerNm[1] = -0.203f;
-        currentPerNm[2] = -0.334f;
-        currentPerNm[3] = 0;
-        currentPerNm[4] = 0;
-        currentPerNm[5] = 0;
-
-        currentBiasA[0] = 0;
-        currentBiasA[1] = -0.011f;
-        currentBiasA[2] = -0.019f;
-        currentBiasA[3] = 0;
-        currentBiasA[4] = 0;
-        currentBiasA[5] = 0;
-
-        // Conservative P0 local fit, also checked with J4 at +/-30 deg.
-        // It is position-only and clamped; no velocity term is involved.
-        joint5SinCoeffA = -0.010f;
-        joint5CosCoeffA = -0.120f;
-        joint5BiasA = 0.005f;
-        joint5MaxCurrentA = 0.18f;
+        // Joint-positive current per generalized gravity torque (A/Nm).
+        // Every joint has the same model shape; unused terms are zero.
+        gravity[0] = {0.0f, 0.0f, 3.3f, 0.0f, 0.0f, 1.0f};
+        gravity[1] = {-0.203f, -0.011f, 3.3f, 0.0f, 0.0f, 1.0f};
+        gravity[2] = {-0.334f, -0.019f, 3.3f, 0.0f, 0.0f, 1.0f};
+        gravity[3] = {0.901902f, 0.006205f, 0.120f, 0.0f, 0.0f, 1.0f};
+        gravity[4] = {1.004686f, -0.003045f, 0.180f, 0.0f, 0.0f, 1.0f};
+        gravity[5] = {0.0f, 0.0f, 3.3f, 0.0f, 0.0f, 1.0f};
 
         const FrictionModel losses[6] = {
             {0.0771f, 0.00336f},
@@ -147,6 +133,53 @@ namespace GravityCompensation
     }
 
 
+    void Model::CalculateGravityTorqueNm(const float q[6], float torqueNm[7]) const
+    {
+        for (int i = 0; i < 7; ++i) torqueNm[i] = 0;
+
+        JointGeometry geometry[6];
+        for (int i = 0; i < 6; ++i) geometry[i] = config.joints[i];
+        // Current dummy.xml wrist3 body plus both closed fingers
+        // (0.0300368 kg each), represented by their combined mass and COM.
+        geometry[5] = {
+            {0.14425f, 0, 0}, {1.5708f, 0, 1.5708f},
+            {0.0009117143f, -0.0000399355f, -0.043471535f}, 0.0870162f
+        };
+
+        Vec3 position{0, 0, 0};
+        Mat3 rotation{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+        Vec3 jointOrigin[7]{};
+        Vec3 jointAxis[7]{};
+        Vec3 linkCom[7]{};
+
+        constexpr float degToRad = 0.017453292519943295f;
+        for (int j = 1; j <= 6; ++j)
+        {
+            const JointGeometry& joint = geometry[j - 1];
+            const Mat3 fixedRotation = RotationRpy(joint.rpy);
+            jointOrigin[j] = Add(position, Transform(rotation, joint.origin));
+            jointAxis[j] = Transform(rotation, Transform(fixedRotation, Vec3{0, 0, 1}));
+            const float angle = (q[j - 1] + config.modelOffsetDeg[j - 1]) * degToRad;
+            rotation = Multiply(Multiply(rotation, fixedRotation), RotationZ(angle));
+            position = jointOrigin[j];
+            linkCom[j] = Add(position, Transform(rotation, joint.com));
+        }
+
+        for (int joint = 1; joint <= 6; ++joint)
+        {
+            float torque = 0;
+            for (int link = joint; link <= 6; ++link)
+            {
+                const Vec3 arm = Sub(linkCom[link], jointOrigin[joint]);
+                const Vec3 force = {0, 0, -geometry[link - 1].massKg * config.gravityMS2};
+                torque += Dot(force, Cross(jointAxis[joint], arm));
+            }
+            // qfrc_bias is the force generalized over joint-positive motion.
+            torqueNm[joint] = std::isfinite(torque) ? -torque : 0;
+        }
+    }
+
+
     void Model::CalculateGravityCurrentA(const float q[6], float currentA[7]) const
     {
         for (int i = 0; i < 7; ++i) currentA[i] = 0;
@@ -160,37 +193,58 @@ namespace GravityCompensation
         constexpr float degToRad = 0.017453292519943295f;
         for (int j = 1; j <= 6; ++j)
         {
-            const JointGeometry& geometry = config.joints[j - 1];
-            const Mat3 fixedRotation = RotationRpy(geometry.rpy);
-            jointOrigin[j] = Add(position, Transform(rotation, geometry.origin));
+            const JointGeometry& joint = config.joints[j - 1];
+            const Mat3 fixedRotation = RotationRpy(joint.rpy);
+            jointOrigin[j] = Add(position, Transform(rotation, joint.origin));
             jointAxis[j] = Transform(rotation, Transform(fixedRotation, Vec3{0, 0, 1}));
             const float angle = (q[j - 1] + config.modelOffsetDeg[j - 1]) * degToRad;
             rotation = Multiply(Multiply(rotation, fixedRotation), RotationZ(angle));
             position = jointOrigin[j];
-            linkCom[j] = Add(position, Transform(rotation, geometry.com));
+            linkCom[j] = Add(position, Transform(rotation, joint.com));
         }
 
         for (int joint = 1; joint <= 6; ++joint)
         {
-            if (config.currentPerNm[joint - 1] == 0) continue;
+            const JointGravityModel& model = config.gravity[joint - 1];
+            float jointCurrentA = 0;
+            if (model.currentPerNm != 0)
+            {
             float torque = 0;
             for (int link = joint; link <= 6; ++link)
             {
                 const Vec3 arm = Sub(linkCom[link], jointOrigin[joint]);
-                const Vec3 force = {0, 0, -config.joints[link - 1].massKg * config.gravityMS2};
+                const Vec3 force = {
+                    0, 0, -config.joints[link - 1].massKg * config.gravityMS2
+                };
                 torque += Dot(force, Cross(jointAxis[joint], arm));
             }
-            const float value = config.currentPerNm[joint - 1] * torque +
-                                config.currentBiasA[joint - 1];
-            currentA[joint] = std::isfinite(value) ? value : 0;
-        }
+                const float value = model.currentPerNm * torque + model.biasA;
+                jointCurrentA = std::isfinite(value) ? value : 0;
+            }
 
-        const float j5Radians = (q[4] + config.modelOffsetDeg[4]) * degToRad;
-        const float j5Current = config.joint5SinCoeffA * sinf(j5Radians) +
-                                config.joint5CosCoeffA * cosf(j5Radians) +
-                                config.joint5BiasA;
-        currentA[5] = std::isfinite(j5Current) ?
-                      Clamp(j5Current, config.joint5MaxCurrentA) : 0;
+            // Joint-angle harmonic terms are a normal per-joint gravity
+            // coefficient, not a special J5 code path.
+            if (model.sinCoeffA != 0 || model.cosCoeffA != 0)
+            {
+                const float radians =
+                    (q[joint - 1] + config.modelOffsetDeg[joint - 1]) * degToRad;
+                const float harmonic = model.sinCoeffA * sinf(radians) +
+                                       model.cosCoeffA * cosf(radians);
+                jointCurrentA = std::isfinite(harmonic) ? jointCurrentA + harmonic : 0;
+            }
+            currentA[joint] = Clamp(jointCurrentA * model.scale, model.limitA);
+        }
+    }
+
+
+    float Model::CalculateCalibratedJointCurrentA(uint8_t joint, const float q[6]) const
+    {
+        if (joint < 1 || joint > 6) return 0;
+        for (unsigned i = 0; i < 6; ++i)
+            if (!std::isfinite(q[i])) return 0;
+        float currents[7]{};
+        CalculateGravityCurrentA(q, currents);
+        return currents[joint];
     }
 
 
@@ -210,5 +264,58 @@ namespace GravityCompensation
         if (joint < 1 || joint > 6 || !std::isfinite(velocityDegS)) return 0;
         const FrictionModel& model = config.friction[joint - 1];
         return model.coulombA + model.viscousAPerDegS * fabsf(velocityDegS);
+    }
+
+
+    const Model::JointGravityModel& Model::GetJointGravityModel(uint8_t joint) const
+    {
+        static const JointGravityModel invalid{};
+        return joint >= 1 && joint <= 6 ? config.gravity[joint - 1] : invalid;
+    }
+
+
+    bool Model::SetJointGravityModel(uint8_t joint, float currentPerNm,
+                                     float biasA, float limitA)
+    {
+        if (joint < 1 || joint > 6 || !std::isfinite(currentPerNm) ||
+            !std::isfinite(biasA) || !std::isfinite(limitA) ||
+            fabsf(currentPerNm) > 10 ||
+            biasA < -1 || biasA > 1 || limitA <= 0 || limitA > 3.3f)
+            return false;
+        config.gravity[joint - 1].currentPerNm = currentPerNm;
+        config.gravity[joint - 1].biasA = biasA;
+        config.gravity[joint - 1].limitA = limitA;
+        return true;
+    }
+
+
+    bool Model::SetJointGravityHarmonics(uint8_t joint, float sinCoeffA,
+                                         float cosCoeffA)
+    {
+        if (joint < 1 || joint > 6 || !std::isfinite(sinCoeffA) ||
+            !std::isfinite(cosCoeffA) || fabsf(sinCoeffA) > 1 ||
+            fabsf(cosCoeffA) > 1)
+            return false;
+        config.gravity[joint - 1].sinCoeffA = sinCoeffA;
+        config.gravity[joint - 1].cosCoeffA = cosCoeffA;
+        return true;
+    }
+
+
+    bool Model::SetJointGravityScale(uint8_t joint, float scale)
+    {
+        if (joint < 1 || joint > 6 || !std::isfinite(scale) ||
+            scale < 0 || scale > 1)
+            return false;
+        config.gravity[joint - 1].scale = scale;
+        return true;
+    }
+
+
+    void Model::ResetJointGravityModel(uint8_t joint)
+    {
+        if (joint < 1 || joint > 6) return;
+        const Model defaults;
+        config.gravity[joint - 1] = defaults.config.gravity[joint - 1];
     }
 }

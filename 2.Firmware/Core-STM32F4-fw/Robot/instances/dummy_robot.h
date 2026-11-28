@@ -109,6 +109,37 @@ public:
         0, 42, 25, 25, 25, 25, 42
     };
 
+    // Robot-wide F1 deployment tables. Rows are indexed by joint 1..6 and row 0
+    // is unused. The F1 firmwares only need their CAN ID burned; F4 writes these
+    // values to every board through SetAllJointParams().
+    static constexpr int32_t DCE_KP[7] = {0, 1000, 1000, 1500, 1000, 1000, 1000};
+    static constexpr int32_t DCE_KV[7] = {0, 80, 80, 80, 80, 80, 80};
+    static constexpr int32_t DCE_KI[7] = {0, 200, 200, 200, 200, 200, 200};
+    static constexpr int32_t DCE_KD[7] = {0, 250, 200, 250, 250, 250, 250};
+
+    // Columns: damping, coulomb, viscous, deadzone, limit.
+    static constexpr int32_t LOCAL_COMP[7][5] = {
+        {0, 0, 0, 0, 0},
+        {0, 77, 24, 42, 500},
+        {0, 125, 69, 25, 500},
+        {0, 102, 19, 25, 500},
+        {0, 250, 54, 25, 500},
+        {0, 185, 44, 25, 500},
+        {0, 167, 0, 42, 500}
+    };
+
+    // Columns: E_sin, E_cos, O_sin, O_cos in motor phase. J5 uses the validated
+    // C group, where all four harmonic coefficients are zero.
+    static constexpr int16_t ALL_HARMONICS_MA[7][4] = {
+        {0, 0, 0, 0},
+        {0, 0, 0, 0},
+        {0, 0, 0, 0},
+        {0, 0, 0, 0},
+        {46, -84, -70, -33},
+        {-25, 57, 41, 22},
+        {0, 0, 0, 0}
+    };
+
 
     struct Config_t
     {
@@ -133,6 +164,46 @@ public:
 
         Config_t();
     } config;
+
+    struct WristAxisConfig_t
+    {
+        bool gravityRequested = false;
+        float gravityScale = 1.0f;
+        float gravityAPerNm = 0;
+        float gravityBiasA = 0;
+        float gravityLimitA = 0;
+        bool frictionRequested = false;
+        float frictionScale = 1.0f;
+        int16_t harmonicBaseMa[4]{};
+        int32_t frictionLimitMa = 0;
+        bool speedRequested = false;
+        bool speedEnabled = false;
+        bool frictionEnabled = false;
+        bool dragAutoEnabled = false;
+        int32_t dragLocalLimitMa = 0;
+        float dragFrictionScale = 0.0f;
+        int16_t dragHarmonicMa[4]{};
+        bool protocolVerified = false;
+        bool controlVerified = false;
+        bool safeOffVerified = true;
+        bool harmonicVerified = false;
+        bool oldProtocol = false;
+        uint8_t appliedGainPercent = 0;
+        uint16_t appliedCapMa = 0;
+        int16_t harmonicMa[4]{};
+        int16_t harmonicReadbackMa[4]{};
+        uint16_t requestedSequence = 0;
+        uint16_t statusSequence = 0;
+        uint8_t statusFlags = 0;
+        int8_t direction = 0;
+        int16_t actualAssistMa = 0;
+        uint32_t statusTick = 0;
+    };
+    WristAxisConfig_t wrist[7];
+    static constexpr int16_t WRIST_BASE_HARMONIC_MA[2][4] = {
+        {46, -84, -70, -33}, // J4 motor domain; candidate k/fit round to mA.
+        {-25, 57, 41, 22}    // J5 motor domain; old unplugged-cable group.
+    };
 
 
     class TuningHelper
@@ -212,6 +283,27 @@ public:
     bool IsGravityFeedForwardEnabled() const;
     void SetDragGains(float _damping, float _frictionAlpha, float _currentLimit);
     void GetDragGains(float* _gains) const;
+
+    bool SetWristGravity(uint32_t joint, float scale);
+    bool SetWristGravityModel(uint32_t joint, float aPerNm, float biasA, float limitA);
+    bool SetGravity(uint32_t joint, float scale);
+    bool SetGravityModel(uint32_t joint, float aPerNm, float biasA, float limitA);
+    bool SetWristHarmonics(uint32_t joint, int32_t eSin, int32_t eCos,
+                           int32_t oSin, int32_t oCos);
+    bool SetWristHarmonicsStored(uint32_t joint, int32_t eSin, int32_t eCos,
+                                 int32_t oSin, int32_t oCos);
+    bool SetLocalCompensation(uint32_t joint, const int32_t values[5], bool storeToEeprom);
+    bool SetAllJointParams();
+    bool SetWristSpeed(uint32_t joint, bool enable);
+    bool SetWristFriction(uint32_t joint, float scale);
+    bool SetWristLocalLimit(uint32_t joint, int32_t limitMa);
+    void SetDragLocalLimit(uint32_t joint, int32_t limitMa);
+    bool RefreshWristStatus(uint32_t joint);
+    bool ResetWristCompensation(uint32_t joint);
+    const WristAxisConfig_t& GetWristConfig(unsigned joint) const { return wrist[joint]; }
+    void UpdateWristHarmonicReadback(unsigned joint, const int16_t valuesMa[4]);
+    void UpdateWristCompensationStatus(unsigned joint, uint8_t flags, int8_t direction,
+                                       int16_t actualAssistMa, uint16_t sequence);
     void CheckSafety();
     bool ClearFaults();
     bool HasFault() const;
@@ -248,6 +340,31 @@ public:
             make_protocol_function("set_joint_speed", *this, &DummyRobot::SetJointSpeed, "speed"),
             make_protocol_function("set_joint_acc", *this, &DummyRobot::SetJointAcceleration, "acc"),
             make_protocol_function("set_command_mode", *this, &DummyRobot::SetCommandMode, "mode"),
+            make_protocol_function("set_wrist_gravity", *this, &DummyRobot::SetWristGravity,
+                                   "joint", "scale"),
+            make_protocol_function("set_wrist_gravity_model", *this,
+                                   &DummyRobot::SetWristGravityModel,
+                                   "joint", "a_per_nm", "bias_a", "limit_a"),
+            make_protocol_function("set_gravity", *this, &DummyRobot::SetGravity,
+                                   "joint", "scale"),
+            make_protocol_function("set_gravity_model", *this,
+                                   &DummyRobot::SetGravityModel,
+                                   "joint", "a_per_nm", "bias_a", "limit_a"),
+            make_protocol_function("set_wrist_harmonics", *this,
+                                   &DummyRobot::SetWristHarmonics,
+                                   "joint", "e_sin", "e_cos", "o_sin", "o_cos"),
+            make_protocol_function("set_wrist_speed", *this, &DummyRobot::SetWristSpeed,
+                                   "joint", "enable"),
+            make_protocol_function("set_wrist_friction", *this, &DummyRobot::SetWristFriction,
+                                   "joint", "scale"),
+            make_protocol_function("set_wrist_local_limit", *this,
+                                   &DummyRobot::SetWristLocalLimit, "joint", "limit"),
+            make_protocol_function("refresh_wrist_status", *this, &DummyRobot::RefreshWristStatus,
+                                   "joint"),
+            make_protocol_function("reset_wrist_compensation", *this,
+                                   &DummyRobot::ResetWristCompensation, "joint"),
+            make_protocol_function("set_all_joint_params", *this,
+                                   &DummyRobot::SetAllJointParams),
             make_protocol_object("tuning", tuningHelper.MakeProtocolDefinitions())
         );
     }
@@ -302,7 +419,19 @@ private:
     uint32_t enabledAt = 0;
     uint16_t feedForwardSequence = 0;
     uint16_t dragSequence = 0;
+    uint16_t wristSequence = 0;
     float dragVelocityFiltered[7]{};
+    float CalculateWristGravityCurrentA(uint8_t joint) const;
+    bool ApplyWristCompensation(unsigned joint, bool enable);
+    bool SendWristControl(unsigned joint, bool assistEnabled,
+                          bool keepSpeedMeasurement, bool verify = true);
+    bool ConfirmWristStatus(unsigned joint, uint16_t expectedSequence,
+                            bool expectedEnabled);
+    void ClearWristRuntimeState(unsigned joint, bool clearConfiguration);
+    void SuspendWristCompensationNow();
+    void DisableWristCompensationNow();
+    void PollWristStatus(uint32_t tick);
+    uint16_t NextWristSequence();
 };
 
 
