@@ -55,7 +55,9 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
 
     // Reject short frames before touching payload; inquiries/hold/clear have no arguments.
     if (((_cmd >= 0x01 && _cmd <= 0x07 && _cmd != 0x02) && _len < 4) ||
-        ((_cmd == 0x06 || _cmd == 0x07 || _cmd == 0x0A || _cmd == 0x0B || _cmd == 0x0C) && _len < 8) ||
+        ((_cmd == 0x06 || _cmd == 0x07 || _cmd == 0x0A || _cmd == 0x0B ||
+          _cmd == 0x0C || _cmd == 0x0D || _cmd == 0x0E ||
+          _cmd == 0x0F || _cmd == 0x10) && _len < 8) ||
         ((_cmd >= 0x11 && _cmd <= 0x1B) && _len < 5))
         return;
     if ((_cmd >= 0x03 && _cmd <= 0x07) || _cmd == 0x0A || _cmd == 0x0B ||
@@ -162,6 +164,29 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
         case 0x0C: // Set one local compensation parameter; byte 5 requests EEPROM storage.
             motor.controller->SetLocalCompensationParam(
                 _data[4], ReadValue<int32_t>(_data), _data[5] != 0);
+            break;
+        case 0x0D: // RAM-only motor-domain E/O harmonic coefficients.
+            motor.controller->SetMotorDomainHarmonics(
+                ReadValue<int16_t>(_data), ReadValue<int16_t>(_data + 2),
+                ReadValue<int16_t>(_data + 4), ReadValue<int16_t>(_data + 6));
+            break;
+        case 0x10: // Persist motor-domain E/O harmonic coefficients.
+            motor.controller->SetMotorDomainHarmonics(
+                ReadValue<int16_t>(_data), ReadValue<int16_t>(_data + 2),
+                ReadValue<int16_t>(_data + 4), ReadValue<int16_t>(_data + 6), true);
+            break;
+        case 0x0E: // RAM-only per-node low-speed/local-compensation opt-in.
+            if (_data[0] != 0xB4 || _data[1] != 2 ||
+                _data[2] > 1)
+                break;
+            motor.controller->SetLocalCompOptIn(
+                _data[2] == 1, _data[3], ReadValue<uint16_t>(_data + 4),
+                ReadValue<uint16_t>(_data + 6));
+            break;
+        case 0x0F: // Addressed enhanced drag lease; never accepted without opt-in.
+            motor.controller->RequestExtendedDragCurrent(
+                ReadValue<int16_t>(_data), ReadValue<uint16_t>(_data + 2),
+                ReadValue<uint16_t>(_data + 4), ReadValue<uint16_t>(_data + 6));
             break;
 
             // 0x10~0x1F CMDs with Memory
@@ -291,6 +316,81 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             reply[6] = flags;
             reply[7] = 0xA2;
             txHeader.StdId = (boardConfig.canNodeId << 7) | 0x26;
+            CAN_Send(&txHeader, reply);
+        }
+            break;
+
+        case 0x27: // Versioned local-compensation and accurate-velocity status.
+        {
+            uint8_t reply[8] = {};
+            uint8_t flags = 0;
+            if (motor.controller->IsLocalCompOptInEnabled()) flags |= 1;
+            if (motor.controller->IsAccurateVelocityReady()) flags |= 2;
+            const int8_t direction = motor.controller->GetMotionDirection();
+            const int16_t actual = static_cast<int16_t>(
+                motor.controller->GetLocalCompensationCurrent_mA());
+            const uint16_t sequence = motor.controller->GetLocalCompSequence();
+            reply[0] = 0xB4;
+            reply[1] = 2;
+            reply[2] = flags;
+            memcpy(reply + 3, &direction, 1);
+            memcpy(reply + 4, &actual, 2);
+            memcpy(reply + 6, &sequence, 2);
+            txHeader.StdId = (boardConfig.canNodeId << 7) | 0x27;
+            CAN_Send(&txHeader, reply);
+        }
+            break;
+
+        case 0x28: // Read back the four RAM-only motor-domain harmonics.
+        {
+            uint8_t reply[8] = {};
+            int16_t eSin, eCos, oSin, oCos;
+            motor.controller->GetMotorDomainHarmonics(eSin, eCos, oSin, oCos);
+            memcpy(reply, &eSin, 2);
+            memcpy(reply + 2, &eCos, 2);
+            memcpy(reply + 4, &oSin, 2);
+            memcpy(reply + 6, &oCos, 2);
+            txHeader.StdId = (boardConfig.canNodeId << 7) | 0x28;
+            CAN_Send(&txHeader, reply);
+        }
+            break;
+
+        case 0x29: // Read the effective local-compensation values by page.
+        case 0x2A:
+        case 0x2B:
+        case 0x2C:
+        {
+            uint8_t reply[8] = {};
+            int32_t values[5]{};
+            motor.controller->GetLocalCompensationParams(values);
+            const uint8_t page = _cmd - 0x29;
+            switch (page)
+            {
+                case 0:
+                    memcpy(reply, &values[0], sizeof(values[0]));
+                    memcpy(reply + 4, &values[1], sizeof(values[1]));
+                    break;
+                case 1:
+                    memcpy(reply, &values[2], sizeof(values[2]));
+                    memcpy(reply + 4, &values[3], sizeof(values[3]));
+                    break;
+                case 2:
+                    memcpy(reply, &values[4], sizeof(values[4]));
+                    break;
+                case 3:
+                {
+                    int16_t eSin, eCos, oSin, oCos;
+                    motor.controller->GetMotorDomainHarmonics(eSin, eCos, oSin, oCos);
+                    memcpy(reply, &eSin, 2);
+                    memcpy(reply + 2, &eCos, 2);
+                    memcpy(reply + 4, &oSin, 2);
+                    memcpy(reply + 6, &oCos, 2);
+                    break;
+                }
+                default:
+                    break;
+            }
+            txHeader.StdId = (boardConfig.canNodeId << 7) | (0x29U + page);
             CAN_Send(&txHeader, reply);
         }
             break;

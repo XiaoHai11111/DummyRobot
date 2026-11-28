@@ -2,20 +2,23 @@
 
 #include <cstdint>
 
-// Integer-only stage-2 local compensation. assistCoeffQ16 is
+// Integer-only local compensation. assistCoeffQ16 is
 // (viscous - damping) in mA per motor rev/s, scaled to Q16 per encoder step/s.
+// harmonicCurrent_mA already contains E + direction * O. blendQ16 ramps the
+// whole correction in/out after the direction filter has confidence.
 // Keep this in a helper so the code-generation test can verify that the
 // 20 kHz path never emits software float/64-bit division on Cortex-M3.
-inline int32_t ApplyLocalCompensationQ16(int32_t current_mA, int32_t velocityStepsPerS,
-                                         int32_t assistCoeffQ16, int32_t coulomb_mA,
-                                         int32_t deadzoneStepsPerS, int32_t rampInvQ16,
-                                         int32_t limit_mA, int32_t currentLimit_mA)
+inline int32_t CalculateLocalCompensationQ16(int32_t velocityStepsPerS,
+                                             int32_t assistCoeffQ16, int32_t coulomb_mA,
+                                             int32_t deadzoneStepsPerS, int32_t rampInvQ16,
+                                             int32_t harmonicCurrent_mA, int32_t blendQ16,
+                                             int32_t limit_mA)
 {
-    if (limit_mA <= 0) return current_mA;
+    if (limit_mA <= 0 || blendQ16 <= 0) return 0;
 
     const int64_t velocity = velocityStepsPerS;
     const int64_t speed = velocity >= 0 ? velocity : -velocity;
-    if (speed <= deadzoneStepsPerS) return current_mA;
+    if (speed <= deadzoneStepsPerS) return 0;
 
     // Ramp the Coulomb term from zero to full over one deadzone width. Without
     // this, a zero/deadzone=0 configuration injects full assist on encoder dither.
@@ -29,10 +32,23 @@ inline int32_t ApplyLocalCompensationQ16(int32_t current_mA, int32_t velocitySte
     int64_t correction_mA = (static_cast<int64_t>(assistCoeffQ16) * velocity) >> 16;
     const int64_t coulomb = (static_cast<int64_t>(coulomb_mA) * coulombScaleQ16) >> 16;
     correction_mA += velocity > 0 ? coulomb : -coulomb;
+    correction_mA += harmonicCurrent_mA;
+    correction_mA = (correction_mA * blendQ16) >> 16;
     if (correction_mA > limit_mA) correction_mA = limit_mA;
     else if (correction_mA < -limit_mA) correction_mA = -limit_mA;
+    return static_cast<int32_t>(correction_mA);
+}
 
-    int64_t total = static_cast<int64_t>(current_mA) + correction_mA;
+inline int32_t ApplyLocalCompensationQ16(int32_t current_mA, int32_t velocityStepsPerS,
+                                         int32_t assistCoeffQ16, int32_t coulomb_mA,
+                                         int32_t deadzoneStepsPerS, int32_t rampInvQ16,
+                                         int32_t limit_mA, int32_t currentLimit_mA)
+{
+    if (limit_mA <= 0) return current_mA;
+    const int32_t correction = CalculateLocalCompensationQ16(
+        velocityStepsPerS, assistCoeffQ16, coulomb_mA, deadzoneStepsPerS,
+        rampInvQ16, 0, 65536, limit_mA);
+    int64_t total = static_cast<int64_t>(current_mA) + correction;
     if (total > currentLimit_mA) total = currentLimit_mA;
     else if (total < -currentLimit_mA) total = -currentLimit_mA;
     return static_cast<int32_t>(total);

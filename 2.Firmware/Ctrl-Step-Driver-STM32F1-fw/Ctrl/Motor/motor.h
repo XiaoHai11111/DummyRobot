@@ -96,6 +96,12 @@ public:
         // One encoder step per 20 kHz tick becomes ~625 steps/s after the 1/32
         // velocity filter, i.e. ~12 in BoardConfig units. 20 leaves margin.
         static constexpr int32_t LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000 = 20;
+        static constexpr uint16_t LOCAL_COMP_SPEED_WINDOW_TICKS = 256;
+        static constexpr uint8_t LOCAL_COMP_DIRECTION_CONFIRM_WINDOWS = 2;
+        static constexpr int32_t LOCAL_COMP_RAMP_UP_Q16_PER_TICK = 656;
+        static constexpr int32_t LOCAL_COMP_RAMP_DOWN_Q16_PER_TICK = 3277;
+        static constexpr uint16_t LOCAL_COMP_ASSIST_CAP_LIMIT_mA = 500;
+        static constexpr int16_t MOTOR_DOMAIN_HARMONIC_LIMIT_mA = 500;
 
         typedef struct
         {
@@ -169,7 +175,26 @@ public:
         void SetCurrentSetPoint(int32_t _cur);
         bool RequestCurrentFeedForward(float _amps, uint16_t _seq, uint16_t _leaseMs);
         bool RequestDragCurrent(float _amps, uint16_t _seq, uint16_t _leaseMs);
+        bool RequestExtendedDragCurrent(int16_t _baseCurrent_mA,
+                                       uint16_t _totalLimit_mA,
+                                       uint16_t _sequence,
+                                       uint16_t _leaseFlags);
         bool SetLocalCompensationParam(uint8_t _index, int32_t _value, bool _storeToEeprom = false);
+        void GetLocalCompensationParams(int32_t values[5]) const;
+        bool SetLocalCompOptIn(bool _enable, uint8_t _gainPercent,
+                               uint16_t _sequence, uint16_t _assistCap_mA);
+        bool SetMotorDomainHarmonics(int16_t _eSin, int16_t _eCos,
+                                     int16_t _oSin, int16_t _oCos,
+                                     bool _storeToEeprom = false);
+        void GetMotorDomainHarmonics(int16_t& _eSin, int16_t& _eCos,
+                                     int16_t& _oSin, int16_t& _oCos) const;
+        bool IsLocalCompOptInEnabled() const;
+        uint8_t GetLocalCompGainPercent() const;
+        uint16_t GetLocalCompAssistCap_mA() const;
+        bool IsAccurateVelocityReady() const;
+        int8_t GetMotionDirection() const;
+        int32_t GetLocalCompensationCurrent_mA() const;
+        uint16_t GetLocalCompSequence() const;
         void ClearFeedForward();
         int32_t GetFeedbackCurrent_mA() const;
         int32_t GetFeedForwardCurrent_mA() const;
@@ -229,6 +254,9 @@ public:
         volatile int32_t dragRequestCurrent_mA{0};
         volatile uint16_t dragRequestSeq{0};
         volatile uint16_t dragRequestLeaseMs{0};
+        volatile bool dragRequestEnhanced{false};
+        volatile uint16_t dragRequestTotalLimit_mA{0};
+        volatile uint16_t dragRequestLeaseFlags{0};
         int32_t feedForwardCurrent_mA{0};
         int32_t feedbackCurrent_mA{0};
         int32_t totalCurrent_mA{0};
@@ -238,6 +266,42 @@ public:
         uint32_t dragLeaseTicks{0};
         bool feedForwardActive{false};
         bool dragActive{false};
+        bool dragEnhanced{false};
+        int32_t dragTotalLimit_mA{0};
+        uint16_t dragLeaseFlags{0};
+        bool encoderInitialized{false};
+        bool localCompOptIn{false};
+        int32_t localCompGainQ16{0};
+        int32_t localCompAssistCap_mA{0};
+        bool accurateVelocityReady{false};
+        int32_t accurateVelocityWindowDelta{0};
+        uint16_t accurateVelocityWindowTicks{0};
+        int32_t accurateVelocity{0};
+        int8_t motionDirection{0};
+        int8_t motionDirectionCandidate{0};
+        uint8_t motionDirectionConfirmWindows{0};
+        int32_t localCompRampQ16{0};
+        int32_t localCompTargetCurrent_mA{0};
+        int32_t localCompensationCurrent_mA{0};
+        int16_t harmonicESin_mA{0};
+        int16_t harmonicECos_mA{0};
+        int16_t harmonicOSin_mA{0};
+        int16_t harmonicOCos_mA{0};
+        struct LocalCompensationSnapshot_t
+        {
+            bool enabled;
+            uint8_t gainPercent;
+            uint16_t sequence;
+            uint16_t assistCap_mA;
+            int16_t eSin_mA;
+            int16_t eCos_mA;
+            int16_t oSin_mA;
+            int16_t oCos_mA;
+        };
+        LocalCompensationSnapshot_t localCompSnapshot{};
+        volatile uint32_t localCompSnapshotWriteSeq{0};
+        volatile uint32_t localCompSnapshotEpoch{0};
+        uint32_t appliedLocalCompSnapshotEpoch{0};
         bool feedForwardLimited{false};
         int32_t focPosition{};
         uint32_t stalledTime{};
@@ -251,6 +315,14 @@ public:
 
 
         void AttachConfig(Config_t* _config);
+        bool ReadLocalCompSnapshot(LocalCompensationSnapshot_t& snapshot) const;
+        void PublishLocalCompSnapshot(const LocalCompensationSnapshot_t& snapshot);
+        void ConsumeLocalCompSnapshot();
+        void UpdateAccurateVelocity(int32_t deltaPosition);
+        void UpdateMotionDirection();
+        int32_t CalculateHarmonicCurrent_mA() const;
+        void ResetLocalCompensationDynamics();
+        void ClearLocalCompensationOutput();
         int32_t ApplyLeaseLocalCompensation(int32_t current);
         void CalcCurrentToOutput(int32_t current);
         void CalcPidToOutput(int32_t _speed);

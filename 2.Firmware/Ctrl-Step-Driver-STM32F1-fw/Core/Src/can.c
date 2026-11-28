@@ -23,6 +23,7 @@
 /* USER CODE BEGIN 0 */
 #include "common_inc.h"
 #include "configurations.h"
+#include "can_command_filter.h"
 
 CAN_TxHeaderTypeDef TxHeader;
 CAN_RxHeaderTypeDef RxHeader;
@@ -198,8 +199,10 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* CanHandle)
 
     uint8_t id = (RxHeader.StdId >> 7); // 4Bits ID & 7Bits Msg
     uint8_t cmd = RxHeader.StdId & 0x7F; // 4Bits ID & 7Bits Msg
-    if (RxHeader.IDE == CAN_ID_STD && RxHeader.RTR == CAN_RTR_DATA &&
-        (id == 0 || id == boardConfig.canNodeId))
+    if (CanRxCommandAccepted(boardConfig.canNodeId,
+                             RxHeader.IDE == CAN_ID_STD,
+                             RxHeader.RTR == CAN_RTR_DATA,
+                             id, cmd))
     {
         OnCanCmd(cmd, RxData, RxHeader.DLC);
     }

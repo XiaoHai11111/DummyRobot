@@ -86,6 +86,20 @@ set_source_files_properties(
         Port/mt6816_stm32.cpp Port/tb67h450_stm32.cpp UserApp/main.cpp
         PROPERTIES COMPILE_OPTIONS "-O2;-fno-fast-math")
 
+# CAN dispatch is interrupt driven rather than part of the 20 kHz control path.
+# Prefer size here to keep the latest protocol additions inside the 95 KiB
+# application flash window while retaining the real-time -O2 settings above.
+set_source_files_properties(
+        UserApp/protocols/interface_can.cpp
+        PROPERTIES COMPILE_OPTIONS "-Os;-fno-fast-math;-ffunction-sections;-fdata-sections")
+set_source_files_properties(
+        UserApp/protocols/interface_uart.cpp
+        Ctrl/Signal/button_base.cpp Ctrl/Signal/led_base.cpp
+        Ctrl/Sensor/Encoder/encoder_calibrator_base.cpp
+        Port/button_stm32.cpp Port/led_stm32.cpp
+        Port/encoder_calibrator_stm32.cpp
+        PROPERTIES COMPILE_OPTIONS "-Os;-fno-fast-math;-ffunction-sections;-fdata-sections")
+
 add_executable(${PROJECT_NAME}.elf ${SOURCES} ${LINKER_SCRIPT})
 set_property(TARGET ${PROJECT_NAME}.elf APPEND PROPERTY LINK_DEPENDS ${LINKER_SCRIPT})
 

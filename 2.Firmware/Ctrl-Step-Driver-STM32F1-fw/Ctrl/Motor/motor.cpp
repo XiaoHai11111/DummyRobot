@@ -5,6 +5,36 @@
 #include <cmath>
 #include <cstring>
 
+namespace
+{
+constexpr int32_t MOTOR_POSITION_COUNTS_PER_REV = 200 * 256;
+constexpr int32_t MOTOR_HARMONIC_TABLE_SIZE = 128;
+constexpr int32_t MOTOR_HARMONIC_QUARTER_TABLE = MOTOR_HARMONIC_TABLE_SIZE / 4;
+
+// sin(2*pi*i/128) in Q15. Linear interpolation between entries keeps the
+// integer phase error well below one milliamp at the 500 mA command limit.
+const int16_t motorHarmonicSinQ15[MOTOR_HARMONIC_TABLE_SIZE] = {
+         0,    1608,    3212,    4808,    6393,    7962,    9512,   11039,   12539,   14010,   15446,   16846,   18204,   19519,   20787,   22005,
+     23170,   24279,   25329,   26319,   27245,   28105,   28898,   29621,   30273,   30852,   31356,   31785,   32137,   32412,   32609,   32728,
+     32767,   32728,   32609,   32412,   32137,   31785,   31356,   30852,   30273,   29621,   28898,   28105,   27245,   26319,   25329,   24279,
+     23170,   22005,   20787,   19519,   18204,   16846,   15446,   14010,   12539,   11039,    9512,    7962,    6393,    4808,    3212,    1608,
+         0,   -1608,   -3212,   -4808,   -6393,   -7962,   -9512,  -11039,  -12539,  -14010,  -15446,  -16846,  -18204,  -19519,  -20787,  -22005,
+    -23170,  -24279,  -25329,  -26319,  -27245,  -28105,  -28898,  -29621,  -30273,  -30852,  -31356,  -31785,  -32137,  -32412,  -32609,  -32728,
+    -32767,  -32728,  -32609,  -32412,  -32137,  -31785,  -31356,  -30852,  -30273,  -29621,  -28898,  -28105,  -27245,  -26319,  -25329,  -24279,
+    -23170,  -22005,  -20787,  -19519,  -18204,  -16846,  -15446,  -14010,  -12539,  -11039,   -9512,   -7962,   -6393,   -4808,   -3212,   -1608,
+};
+
+int32_t InterpolateHarmonicSine(uint32_t index, uint32_t fractionQ16)
+{
+    const int32_t first = motorHarmonicSinQ15[index];
+    const int32_t second =
+        motorHarmonicSinQ15[(index + 1) & (MOTOR_HARMONIC_TABLE_SIZE - 1)];
+    return first + static_cast<int32_t>(
+                       (static_cast<int64_t>(second - first) * fractionQ16) >>
+                       16);
+}
+}
+
 
 bool Motor::Controller::IsNewerSequence(uint16_t sequence, uint16_t last)
 {
@@ -37,8 +67,7 @@ void Motor::AttachDriver(DriverBase* _driver)
 void Motor::CloseLoopControlTick()
 {
     /************************************ First Called ************************************/
-    static bool isFirstCalled = true;
-    if (isFirstCalled)
+    if (!controller->encoderInitialized)
     {
         int32_t angle;
         if (config.motionParams.encoderHomeOffset < MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 2)
@@ -62,7 +91,7 @@ void Motor::CloseLoopControlTick()
         controller->realPosition = angle;
         controller->realPositionLast = angle;
 
-        isFirstCalled = false;
+        controller->encoderInitialized = true;
         return;
     }
 
@@ -83,6 +112,14 @@ void Motor::CloseLoopControlTick()
     // Naive-Position calculate
     controller->realPositionLast = controller->realPosition;
     controller->realPosition += deltaLapPosition;
+    controller->ConsumeLocalCompSnapshot();
+    if (controller->localCompOptIn &&
+        controller->modeRunning != MODE_STOP &&
+        !controller->isStalled &&
+        !controller->overloadFlag &&
+        !controller->controlOverrunFlag &&
+        encoder->IsCalibrated())
+        controller->UpdateAccurateVelocity(deltaLapPosition);
 
     /********************************* Estimate Data *********************************/
     // Estimate Velocity
@@ -91,7 +128,7 @@ void Motor::CloseLoopControlTick()
     controller->estVelocityIntegral +=
         (controller->realPosition - controller->realPositionLast) * motionPlanner.CONTROL_FREQUENCY;
     controller->estVelocity = controller->estVelocityIntegral >> 5;
-    controller->estVelocityIntegral -= (controller->estVelocity << 5);
+    controller->estVelocityIntegral -= controller->estVelocity * 32;
 
     // Estimate Position
     controller->estLeadPosition = Controller::CompensateAdvancedAngle(controller->estVelocity);
@@ -129,6 +166,8 @@ void Motor::CloseLoopControlTick()
 
     /************************************ Ctrl Loop ************************************/
     if (controller->isStalled ||
+        controller->overloadFlag ||
+        controller->controlOverrunFlag ||
         controller->softDisable ||
         !encoder->IsCalibrated())
     {
@@ -380,15 +419,244 @@ void Motor::CloseLoopControlTick()
 }
 
 
+void Motor::Controller::UpdateAccurateVelocity(int32_t deltaPosition)
+{
+    if (!localCompOptIn) return;
+
+    accurateVelocityWindowDelta += deltaPosition;
+    ++accurateVelocityWindowTicks;
+    if (accurateVelocityWindowTicks < LOCAL_COMP_SPEED_WINDOW_TICKS) return;
+
+    // Each delta was already unwrapped across encoder count wrap. Averaging
+    // the accumulated displacement gives unity DC gain without window wrap.
+    accurateVelocity = static_cast<int32_t>(
+        (static_cast<int64_t>(accurateVelocityWindowDelta) *
+         context->motionPlanner.CONTROL_FREQUENCY) >>
+        (LOCAL_COMP_SPEED_WINDOW_TICKS == 256 ? 8 : 0));
+    accurateVelocityReady = true;
+    accurateVelocityWindowDelta = 0;
+    accurateVelocityWindowTicks = 0;
+    UpdateMotionDirection();
+}
+
+
+void Motor::Controller::UpdateMotionDirection()
+{
+    if (!localCompOptIn || !accurateVelocityReady)
+    {
+        motionDirection = 0;
+        motionDirectionCandidate = 0;
+        motionDirectionConfirmWindows = 0;
+        return;
+    }
+
+    const int32_t speed = accurateVelocity >= 0 ? accurateVelocity : -accurateVelocity;
+    const int8_t direction =
+        accurateVelocity > 0 ? 1 : (accurateVelocity < 0 ? -1 : 0);
+    const int32_t baseThreshold =
+        config->localComp.deadzoneSteps > 0 ? config->localComp.deadzoneSteps : 1024;
+    const int32_t enterThreshold = baseThreshold * 2;
+    const int32_t exitThreshold = baseThreshold;
+
+    if (motionDirection == 0)
+    {
+        if (direction == 0 || speed < enterThreshold)
+        {
+            motionDirectionCandidate = 0;
+            motionDirectionConfirmWindows = 0;
+            return;
+        }
+        if (direction != motionDirectionCandidate)
+        {
+            motionDirectionCandidate = direction;
+            motionDirectionConfirmWindows = 1;
+        } else if (motionDirectionConfirmWindows <
+                   LOCAL_COMP_DIRECTION_CONFIRM_WINDOWS)
+        {
+            ++motionDirectionConfirmWindows;
+        }
+        if (motionDirectionConfirmWindows >= LOCAL_COMP_DIRECTION_CONFIRM_WINDOWS)
+            motionDirection = motionDirectionCandidate;
+        return;
+    }
+
+    if (direction == motionDirection)
+    {
+        motionDirectionCandidate = 0;
+        motionDirectionConfirmWindows = 0;
+        if (speed <= exitThreshold)
+            motionDirection = 0;
+        return;
+    }
+
+    // A confirmed reversal must first fade the old assist to zero, then build
+    // confidence in the new direction. Small speed excursions stay in the
+    // hysteresis band and do not toggle the output.
+    if (direction != 0 && speed >= enterThreshold)
+    {
+        motionDirection = 0;
+        motionDirectionCandidate = direction;
+        motionDirectionConfirmWindows = 1;
+    } else if (speed <= exitThreshold)
+    {
+        motionDirection = 0;
+        motionDirectionCandidate = 0;
+        motionDirectionConfirmWindows = 0;
+    } else
+    {
+        motionDirectionCandidate = 0;
+        motionDirectionConfirmWindows = 0;
+    }
+}
+
+
+int32_t Motor::Controller::CalculateHarmonicCurrent_mA() const
+{
+    int32_t relativePosition =
+        realLapPosition - context->config.motionParams.encoderHomeOffset;
+    relativePosition %= MOTOR_POSITION_COUNTS_PER_REV;
+    if (relativePosition < 0) relativePosition += MOTOR_POSITION_COUNTS_PER_REV;
+
+    // Both divisors are compile-time constants, so Cortex-M3 emits UMULL
+    // sequences rather than calls to the software divide routines.
+    const uint32_t phaseIndex = static_cast<uint32_t>(relativePosition) /
+                                (MOTOR_POSITION_COUNTS_PER_REV /
+                                 MOTOR_HARMONIC_TABLE_SIZE);
+    const uint32_t phaseRemainder =
+        static_cast<uint32_t>(relativePosition) -
+        phaseIndex *
+            (MOTOR_POSITION_COUNTS_PER_REV / MOTOR_HARMONIC_TABLE_SIZE);
+    const uint32_t phaseFractionQ16 = phaseRemainder * 164U;
+    const uint32_t cosineIndex =
+        (phaseIndex + MOTOR_HARMONIC_QUARTER_TABLE) &
+        (MOTOR_HARMONIC_TABLE_SIZE - 1);
+    const int32_t sine = InterpolateHarmonicSine(phaseIndex, phaseFractionQ16);
+    const int32_t cosine = InterpolateHarmonicSine(cosineIndex, phaseFractionQ16);
+
+    const int32_t evenCurrent = static_cast<int32_t>(
+        (static_cast<int64_t>(harmonicESin_mA) * sine +
+         static_cast<int64_t>(harmonicECos_mA) * cosine) >>
+        15);
+    const int32_t oddCurrent = static_cast<int32_t>(
+        (static_cast<int64_t>(harmonicOSin_mA) * sine +
+         static_cast<int64_t>(harmonicOCos_mA) * cosine) >>
+        15);
+    return evenCurrent + motionDirection * oddCurrent;
+}
+
+
+void Motor::Controller::ResetLocalCompensationDynamics()
+{
+    accurateVelocityWindowDelta = 0;
+    accurateVelocityWindowTicks = 0;
+    accurateVelocity = 0;
+    accurateVelocityReady = false;
+    motionDirection = 0;
+    motionDirectionCandidate = 0;
+    motionDirectionConfirmWindows = 0;
+    ClearLocalCompensationOutput();
+}
+
+
+void Motor::Controller::ClearLocalCompensationOutput()
+{
+    localCompRampQ16 = 0;
+    localCompTargetCurrent_mA = 0;
+    localCompensationCurrent_mA = 0;
+}
+
+
 int32_t Motor::Controller::ApplyLeaseLocalCompensation(int32_t current)
 {
-    if (!dragActive || dragLeaseTicks == 0) return current;
+    if (!dragActive || dragLeaseTicks == 0)
+    {
+        ClearLocalCompensationOutput();
+        return current;
+    }
+
     const LocalCompensationConfig_t& compensation = config->localComp;
-    return ApplyLocalCompensationQ16(current, estVelocity,
-                                     compensation.assistCoeffQ16, compensation.coulomb_mA,
-                                     compensation.deadzoneSteps, compensation.rampInvQ16,
-                                     compensation.limit_mA,
-                                     context->config.motionParams.ratedCurrent);
+    if (!localCompOptIn)
+    {
+        const int32_t result = ApplyLocalCompensationQ16(
+            current, estVelocity, compensation.assistCoeffQ16,
+            compensation.coulomb_mA, compensation.deadzoneSteps,
+            compensation.rampInvQ16, compensation.limit_mA,
+            context->config.motionParams.ratedCurrent);
+        localCompensationCurrent_mA = result - current;
+        return result;
+    }
+
+    // An old 0x0B stream opts the node into accurate diagnostics, but never
+    // receives the new assist. Only an addressed 0x0F lease enables it.
+    if (!dragEnhanced)
+    {
+        ClearLocalCompensationOutput();
+        return current;
+    }
+
+    const int32_t speed = accurateVelocity >= 0 ? accurateVelocity : -accurateVelocity;
+    const bool directionMatches =
+        motionDirection != 0 && accurateVelocity != 0 &&
+        (accurateVelocity > 0 ? 1 : -1) == motionDirection;
+    int32_t correctionTarget_mA = 0;
+    if (localCompGainQ16 > 0 && localCompAssistCap_mA > 0 &&
+        compensation.limit_mA > 0 &&
+        directionMatches && speed > compensation.deadzoneSteps)
+    {
+        correctionTarget_mA = CalculateLocalCompensationQ16(
+            accurateVelocity, compensation.assistCoeffQ16, compensation.coulomb_mA,
+            compensation.deadzoneSteps, compensation.rampInvQ16,
+            CalculateHarmonicCurrent_mA(), localCompGainQ16,
+            localCompAssistCap_mA);
+        localCompTargetCurrent_mA = correctionTarget_mA;
+        if (localCompRampQ16 <= 65536 - LOCAL_COMP_RAMP_UP_Q16_PER_TICK)
+            localCompRampQ16 += LOCAL_COMP_RAMP_UP_Q16_PER_TICK;
+        else
+            localCompRampQ16 = 65536;
+    }
+    else
+    {
+        correctionTarget_mA = localCompTargetCurrent_mA;
+        if (localCompRampQ16 > LOCAL_COMP_RAMP_DOWN_Q16_PER_TICK)
+            localCompRampQ16 -= LOCAL_COMP_RAMP_DOWN_Q16_PER_TICK;
+        else
+            localCompRampQ16 = 0;
+        if (localCompRampQ16 == 0)
+        {
+            localCompTargetCurrent_mA = 0;
+            correctionTarget_mA = 0;
+        }
+    }
+
+    int32_t correction = static_cast<int32_t>(
+        (static_cast<int64_t>(correctionTarget_mA) * localCompRampQ16) >> 16);
+    if (correction > localCompAssistCap_mA) correction = localCompAssistCap_mA;
+    else if (correction < -localCompAssistCap_mA) correction = -localCompAssistCap_mA;
+
+    const int32_t ratedLimit = context->config.motionParams.ratedCurrent;
+    int32_t totalLimit = dragTotalLimit_mA;
+    if (totalLimit <= 0 || totalLimit > ratedLimit) totalLimit = ratedLimit;
+
+    /*
+     * The total limit applies to the final output after local assist. The
+     * reported assist is the final safely limited output minus the base
+     * current passed independently through the same total and direction
+     * limits.
+     */
+    int32_t result = current + correction;
+    if (result > totalLimit) result = totalLimit;
+    else if (result < -totalLimit) result = -totalLimit;
+    if ((dragLeaseFlags & 0x4000U) && result > 0) result = 0;
+    if ((dragLeaseFlags & 0x8000U) && result < 0) result = 0;
+
+    int32_t safeBase = current;
+    if (safeBase > totalLimit) safeBase = totalLimit;
+    else if (safeBase < -totalLimit) safeBase = -totalLimit;
+    if ((dragLeaseFlags & 0x4000U) && safeBase > 0) safeBase = 0;
+    if ((dragLeaseFlags & 0x8000U) && safeBase < 0) safeBase = 0;
+
+    localCompensationCurrent_mA = result - safeBase;
+    return result;
 }
 
 
@@ -551,7 +819,8 @@ float Motor::Controller::GetPosition(bool _isLap)
 
 float Motor::Controller::GetVelocity()
 {
-    return (float) estVelocity / (float) context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;
+    const int32_t velocity = localCompOptIn ? accurateVelocity : estVelocity;
+    return (float) velocity / (float) context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;
 }
 
 
@@ -648,6 +917,188 @@ bool Motor::Controller::SetLocalCompensationParam(uint8_t _index, int32_t _value
 }
 
 
+void Motor::Controller::GetLocalCompensationParams(int32_t values[5]) const
+{
+    if (!values || !config) return;
+    values[0] = config->localComp.damping_mA_per_motorRevS;
+    values[1] = config->localComp.coulomb_mA;
+    values[2] = config->localComp.viscous_mA_per_motorRevS;
+    values[3] = static_cast<int32_t>(
+        (static_cast<int64_t>(config->localComp.deadzoneSteps) * 1000 +
+         context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 2) /
+        context->MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS);
+    values[4] = config->localComp.limit_mA;
+}
+
+
+bool Motor::Controller::ReadLocalCompSnapshot(
+    LocalCompensationSnapshot_t& snapshot) const
+{
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const uint32_t before = localCompSnapshotWriteSeq;
+        if (before & 1U) continue;
+        snapshot = localCompSnapshot;
+        __sync_synchronize();
+        if (before == localCompSnapshotWriteSeq) return true;
+    }
+    return false;
+}
+
+
+void Motor::Controller::PublishLocalCompSnapshot(
+    const LocalCompensationSnapshot_t& snapshot)
+{
+    ++localCompSnapshotWriteSeq;
+    __sync_synchronize();
+    localCompSnapshot = snapshot;
+    __sync_synchronize();
+    ++localCompSnapshotWriteSeq;
+    __sync_synchronize();
+    ++localCompSnapshotEpoch;
+}
+
+
+void Motor::Controller::ConsumeLocalCompSnapshot()
+{
+    const uint32_t epoch = localCompSnapshotEpoch;
+    if (epoch == appliedLocalCompSnapshotEpoch) return;
+
+    LocalCompensationSnapshot_t snapshot;
+    if (!ReadLocalCompSnapshot(snapshot)) return;
+    appliedLocalCompSnapshotEpoch = epoch;
+
+    const bool hadActiveOptIn = localCompOptIn;
+    localCompOptIn = snapshot.enabled;
+    localCompGainQ16 = static_cast<int32_t>(
+        (static_cast<uint32_t>(snapshot.gainPercent) * 65536U) / 100U);
+    localCompAssistCap_mA = snapshot.assistCap_mA;
+    harmonicESin_mA = snapshot.eSin_mA;
+    harmonicECos_mA = snapshot.eCos_mA;
+    harmonicOSin_mA = snapshot.oSin_mA;
+    harmonicOCos_mA = snapshot.oCos_mA;
+
+    if (hadActiveOptIn && !localCompOptIn)
+        ClearFeedForward();
+    else
+        ResetLocalCompensationDynamics();
+}
+
+
+bool Motor::Controller::SetLocalCompOptIn(bool _enable, uint8_t _gainPercent,
+                                          uint16_t _sequence,
+                                          uint16_t _assistCap_mA)
+{
+    if (!config || _sequence == 0 || _gainPercent > 100 ||
+        _assistCap_mA > LOCAL_COMP_ASSIST_CAP_LIMIT_mA ||
+        (!_enable && (_gainPercent != 0 || _assistCap_mA != 0)))
+        return false;
+
+    LocalCompensationSnapshot_t snapshot{};
+    if (!ReadLocalCompSnapshot(snapshot)) return false;
+    snapshot.enabled = _enable;
+    snapshot.gainPercent = _gainPercent;
+    snapshot.sequence = _sequence;
+    snapshot.assistCap_mA = _assistCap_mA;
+    PublishLocalCompSnapshot(snapshot);
+    return true;
+}
+
+
+bool Motor::Controller::SetMotorDomainHarmonics(int16_t _eSin, int16_t _eCos,
+                                                int16_t _oSin, int16_t _oCos,
+                                                bool _storeToEeprom)
+{
+    if (_eSin < -MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _eSin > MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _eCos < -MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _eCos > MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _oSin < -MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _oSin > MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _oCos < -MOTOR_DOMAIN_HARMONIC_LIMIT_mA ||
+        _oCos > MOTOR_DOMAIN_HARMONIC_LIMIT_mA)
+        return false;
+
+    LocalCompensationSnapshot_t snapshot{};
+    if (!ReadLocalCompSnapshot(snapshot)) return false;
+    snapshot.eSin_mA = _eSin;
+    snapshot.eCos_mA = _eCos;
+    snapshot.oSin_mA = _oSin;
+    snapshot.oCos_mA = _oCos;
+    PublishLocalCompSnapshot(snapshot);
+
+    if (_storeToEeprom)
+    {
+        boardConfig.harmonicESin_mA = _eSin;
+        boardConfig.harmonicECos_mA = _eCos;
+        boardConfig.harmonicOSin_mA = _oSin;
+        boardConfig.harmonicOCos_mA = _oCos;
+        boardConfig.version = BOARD_CONFIG_VERSION;
+        boardConfig.configStatus = CONFIG_COMMIT;
+    }
+    return true;
+}
+
+
+void Motor::Controller::GetMotorDomainHarmonics(int16_t& _eSin, int16_t& _eCos,
+                                                int16_t& _oSin, int16_t& _oCos) const
+{
+    LocalCompensationSnapshot_t snapshot{};
+    if (!ReadLocalCompSnapshot(snapshot))
+        snapshot = LocalCompensationSnapshot_t{};
+    _eSin = snapshot.eSin_mA;
+    _eCos = snapshot.eCos_mA;
+    _oSin = snapshot.oSin_mA;
+    _oCos = snapshot.oCos_mA;
+}
+
+
+bool Motor::Controller::IsLocalCompOptInEnabled() const
+{
+    LocalCompensationSnapshot_t snapshot{};
+    return ReadLocalCompSnapshot(snapshot) && snapshot.enabled;
+}
+
+
+uint8_t Motor::Controller::GetLocalCompGainPercent() const
+{
+    LocalCompensationSnapshot_t snapshot{};
+    return ReadLocalCompSnapshot(snapshot) ? snapshot.gainPercent : 0;
+}
+
+
+uint16_t Motor::Controller::GetLocalCompAssistCap_mA() const
+{
+    LocalCompensationSnapshot_t snapshot{};
+    return ReadLocalCompSnapshot(snapshot) ? snapshot.assistCap_mA : 0;
+}
+
+
+bool Motor::Controller::IsAccurateVelocityReady() const
+{
+    return localCompOptIn && accurateVelocityReady;
+}
+
+
+int8_t Motor::Controller::GetMotionDirection() const
+{
+    return localCompOptIn ? motionDirection : 0;
+}
+
+
+int32_t Motor::Controller::GetLocalCompensationCurrent_mA() const
+{
+    return localCompOptIn ? localCompensationCurrent_mA : 0;
+}
+
+
+uint16_t Motor::Controller::GetLocalCompSequence() const
+{
+    LocalCompensationSnapshot_t snapshot{};
+    return ReadLocalCompSnapshot(snapshot) ? snapshot.sequence : 0;
+}
+
+
 bool Motor::Controller::RequestDragCurrent(float _amps, uint16_t _seq, uint16_t _leaseMs)
 {
     if (!config || !std::isfinite(_amps) ||
@@ -658,11 +1109,48 @@ bool Motor::Controller::RequestDragCurrent(float _amps, uint16_t _seq, uint16_t 
         !IsNewerSequence(_seq, lastDragSequence))
         return false;
 
-    dragRequestWriteSeq++;
+    ++dragRequestWriteSeq;
+    __sync_synchronize();
     dragRequestCurrent_mA = static_cast<int32_t>(_amps * 1000.0f);
     dragRequestSeq = _seq;
     dragRequestLeaseMs = _leaseMs;
-    dragRequestWriteSeq++;
+    dragRequestEnhanced = false;
+    dragRequestTotalLimit_mA = 0;
+    dragRequestLeaseFlags = 0;
+    __sync_synchronize();
+    ++dragRequestWriteSeq;
+    return true;
+}
+
+
+bool Motor::Controller::RequestExtendedDragCurrent(
+    int16_t _baseCurrent_mA, uint16_t _totalLimit_mA,
+    uint16_t _sequence, uint16_t _leaseFlags)
+{
+    if (!config || !IsLocalCompOptInEnabled() || _sequence == 0 ||
+        _baseCurrent_mA < -config->feedForward.maxCurrent ||
+        _baseCurrent_mA > config->feedForward.maxCurrent ||
+        _totalLimit_mA == 0 || _totalLimit_mA > 3300 ||
+        _totalLimit_mA > context->config.motionParams.ratedCurrent)
+        return false;
+
+    const uint16_t leaseMs = _leaseFlags & 0x3FFFU;
+    if (leaseMs < config->feedForward.minLeaseMs ||
+        leaseMs > config->feedForward.maxLeaseMs ||
+        _sequence == dragRequestSeq ||
+        !IsNewerSequence(_sequence, lastDragSequence))
+        return false;
+
+    ++dragRequestWriteSeq;
+    __sync_synchronize();
+    dragRequestCurrent_mA = _baseCurrent_mA;
+    dragRequestSeq = _sequence;
+    dragRequestLeaseMs = leaseMs;
+    dragRequestEnhanced = true;
+    dragRequestTotalLimit_mA = _totalLimit_mA;
+    dragRequestLeaseFlags = _leaseFlags;
+    __sync_synchronize();
+    ++dragRequestWriteSeq;
     return true;
 }
 
@@ -675,6 +1163,10 @@ void Motor::Controller::ClearFeedForward()
     feedForwardLimited = false;
     dragActive = false;
     dragLeaseTicks = 0;
+    dragEnhanced = false;
+    dragTotalLimit_mA = 0;
+    dragLeaseFlags = 0;
+    ResetLocalCompensationDynamics();
     goalCurrent = softCurrent = 0;
 }
 
@@ -719,7 +1211,9 @@ uint16_t Motor::Controller::GetRemainingLeaseMs() const
 {
     const uint32_t ticks = feedForwardLeaseTicks > dragLeaseTicks ?
                            feedForwardLeaseTicks : dragLeaseTicks;
-    return static_cast<uint16_t>(ticks / context->motionPlanner.CONTROL_TICKS_PER_MS);
+    const uint32_t ticksPerMs = context->motionPlanner.CONTROL_TICKS_PER_MS;
+    return static_cast<uint16_t>(
+        (ticks + ticksPerMs - 1) / ticksPerMs);
 }
 
 
@@ -751,15 +1245,22 @@ void Motor::Controller::ConsumeFeedForwardRequest()
         const int32_t mA = dragRequestCurrent_mA;
         const uint16_t seq = dragRequestSeq;
         const uint16_t lease = dragRequestLeaseMs;
+        const bool enhanced = dragRequestEnhanced;
+        const uint16_t totalLimit = dragRequestTotalLimit_mA;
+        const uint16_t leaseFlags = dragRequestLeaseFlags;
         if (before != dragRequestWriteSeq) continue;
         if (seq != 0 && IsNewerSequence(seq, lastDragSequence))
         {
+            if (enhanced && !localCompOptIn) break;
             lastDragSequence = seq;
             if (modeRunning != MODE_COMMAND_CURRENT)
                 SetCtrlMode(MODE_COMMAND_CURRENT);
             context->motionPlanner.currentTracker.SetCurrentAcc(config->feedForward.dragCurrentAcc);
             SetCurrentSetPoint(mA);
             dragActive = true;
+            dragEnhanced = enhanced;
+            dragTotalLimit_mA = totalLimit;
+            dragLeaseFlags = leaseFlags;
             dragLeaseTicks = static_cast<uint32_t>(lease) *
                              context->motionPlanner.CONTROL_TICKS_PER_MS;
         }
@@ -904,6 +1405,7 @@ void Motor::Controller::Init()
     realLapPositionLast = 0;
     realPosition = 0;
     realPositionLast = 0;
+    encoderInitialized = false;
 
     estVelocityIntegral = 0;
     estVelocity = 0;
@@ -924,6 +1426,9 @@ void Motor::Controller::Init()
     dragRequestCurrent_mA = 0;
     dragRequestSeq = 0;
     dragRequestLeaseMs = 0;
+    dragRequestEnhanced = false;
+    dragRequestTotalLimit_mA = 0;
+    dragRequestLeaseFlags = 0;
     feedForwardCurrent_mA = 0;
     feedbackCurrent_mA = 0;
     totalCurrent_mA = 0;
@@ -933,6 +1438,29 @@ void Motor::Controller::Init()
     dragLeaseTicks = 0;
     feedForwardActive = false;
     dragActive = false;
+    dragEnhanced = false;
+    dragTotalLimit_mA = 0;
+    dragLeaseFlags = 0;
+    localCompOptIn = false;
+    localCompGainQ16 = 0;
+    localCompAssistCap_mA = 0;
+    accurateVelocityReady = false;
+    accurateVelocityWindowDelta = 0;
+    accurateVelocityWindowTicks = 0;
+    accurateVelocity = 0;
+    motionDirection = 0;
+    motionDirectionCandidate = 0;
+    motionDirectionConfirmWindows = 0;
+    localCompRampQ16 = 0;
+    localCompTargetCurrent_mA = 0;
+    localCompensationCurrent_mA = 0;
+    harmonicESin_mA = 0;
+    harmonicECos_mA = 0;
+    harmonicOSin_mA = 0;
+    harmonicOCos_mA = 0;
+    LocalCompensationSnapshot_t emptySnapshot{};
+    PublishLocalCompSnapshot(emptySnapshot);
+    appliedLocalCompSnapshotEpoch = localCompSnapshotEpoch;
     feedForwardLimited = false;
 
     softPosition = 0;

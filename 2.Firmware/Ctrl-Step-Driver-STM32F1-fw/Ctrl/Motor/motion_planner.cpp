@@ -372,7 +372,7 @@ void MotionPlanner::PositionInterpolator::CalcSoftGoal(int32_t _goalPosition)
     // average. Adding back 63 * estVelocity would make this filter unstable.
     estPositionIntegral += (recordPosition - recordPositionLast) * context->CONTROL_FREQUENCY;
     estVelocity = estPositionIntegral >> 6;
-    estPositionIntegral -= (estVelocity << 6);
+    estPositionIntegral -= estVelocity * 64;
 
     estPosition = recordPosition;
 

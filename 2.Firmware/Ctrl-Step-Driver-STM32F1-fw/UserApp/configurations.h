@@ -15,7 +15,7 @@ typedef enum configStatus_t
     CONFIG_COMMIT
 } configStatus_t;
 
-#define BOARD_CONFIG_VERSION 2U
+#define BOARD_CONFIG_VERSION 3U
 
 
 typedef struct Config_t
@@ -39,6 +39,10 @@ typedef struct Config_t
     int32_t localViscous_mA_per_motorRevS;
     int32_t localDeadzone_motorRevS_x1000;
     int32_t localCompLimit_mA;
+    int16_t harmonicESin_mA;
+    int16_t harmonicECos_mA;
+    int16_t harmonicOSin_mA;
+    int16_t harmonicOCos_mA;
     uint32_t version;
 } BoardConfig_t;
 

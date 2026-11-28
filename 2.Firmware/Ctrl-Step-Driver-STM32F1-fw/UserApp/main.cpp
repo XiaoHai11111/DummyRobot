@@ -23,7 +23,7 @@ static uint32_t controlBudgetCycles;
 void Main()
 {
     uint64_t serialNum = GetSerialNumber();
-    uint16_t defaultNodeID = 1;
+    uint16_t defaultNodeID = 6;
 
     /*---------- Apply EEPROM Settings ----------*/
     // Setting priority is EEPROM > Motor.h
@@ -54,18 +54,29 @@ void Main()
             .localDeadzone_motorRevS_x1000 =
                 Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000,
             .localCompLimit_mA = 0,
+            .harmonicESin_mA = 0,
+            .harmonicECos_mA = 0,
+            .harmonicOSin_mA = 0,
+            .harmonicOCos_mA = 0,
             .version = BOARD_CONFIG_VERSION
         };
         eeprom.put(0, boardConfig);
     } else if (boardConfig.version != BOARD_CONFIG_VERSION)
     {
-        // Preserve legacy values and initialize only the appended stage-2 fields.
-        boardConfig.localDamping_mA_per_motorRevS = 0;
-        boardConfig.localCoulomb_mA = 0;
-        boardConfig.localViscous_mA_per_motorRevS = 0;
-        boardConfig.localDeadzone_motorRevS_x1000 =
-            Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000;
-        boardConfig.localCompLimit_mA = 0;
+        // Preserve values that already exist in the stored version.
+        if (boardConfig.version < 2U)
+        {
+            boardConfig.localDamping_mA_per_motorRevS = 0;
+            boardConfig.localCoulomb_mA = 0;
+            boardConfig.localViscous_mA_per_motorRevS = 0;
+            boardConfig.localDeadzone_motorRevS_x1000 =
+                Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000;
+            boardConfig.localCompLimit_mA = 0;
+        }
+        boardConfig.harmonicESin_mA = 0;
+        boardConfig.harmonicECos_mA = 0;
+        boardConfig.harmonicOSin_mA = 0;
+        boardConfig.harmonicOCos_mA = 0;
         boardConfig.version = BOARD_CONFIG_VERSION;
         eeprom.put(0, boardConfig);
     }
@@ -87,6 +98,9 @@ void Main()
     motor.controller->SetLocalCompensationParam(2, boardConfig.localViscous_mA_per_motorRevS);
     motor.controller->SetLocalCompensationParam(3, boardConfig.localDeadzone_motorRevS_x1000);
     motor.controller->SetLocalCompensationParam(4, boardConfig.localCompLimit_mA);
+    motor.controller->SetMotorDomainHarmonics(
+        boardConfig.harmonicESin_mA, boardConfig.harmonicECos_mA,
+        boardConfig.harmonicOSin_mA, boardConfig.harmonicOCos_mA);
 
 
     /*---------------- Init Motor ----------------*/
