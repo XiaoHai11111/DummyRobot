@@ -47,6 +47,12 @@ template<int32_t divisor> void compareIntegral() {
 }
 int main() {
     compareIntegral<128>(); compareIntegral<1024>();
+    assert(CalculateLocalCompensationQ16(
+               51200, 128, 100, 1024, 64, 200, 32768, 500) == 200);
+    assert(CalculateLocalCompensationQ16(
+               51200, 128, 100, 1024, 64, 200, 32768, 100) == 100);
+    assert(CalculateLocalCompensationQ16(
+               51200, 128, 100, 1024, 64, 200, 0, 500) == 0);
     ControlTimingStats timing;
     assert(!timing.Observe(3500, 3600));
     assert(!timing.Observe(3601, 3600));
@@ -167,7 +173,16 @@ int main() {
     assert(boardConfig.configStatus == CONFIG_COMMIT);
     boardConfig.configStatus = CONFIG_OK;
 
-    // Drag current is leased; expiry returns to position hold.
+    int32_t reportedLocal[5]{};
+    ffMotor.controller->GetLocalCompensationParams(reportedLocal);
+    assert(reportedLocal[0] == 100 && reportedLocal[1] == 200 &&
+           reportedLocal[2] == 300 &&
+           reportedLocal[3] ==
+               Motor::Controller::LOCAL_COMP_MIN_DEADZONE_motorRevS_x1000 &&
+           reportedLocal[4] == 800);
+
+    // Legacy #LOCALCOMP remains active without the new opt-in. Drag current is
+    // leased; expiry returns to position hold.
     assert(ffMotor.controller->RequestDragCurrent(0.3f, 1, 500));
     ticks(ffMotor, 4000); // Current mode switch and 2 mA/ms current ramp.
     assert(ffMotor.controller->modeRunning == Motor::MODE_COMMAND_CURRENT);
@@ -223,7 +238,8 @@ int main() {
     }
     assert(ffDriver.current == -200);
 
-    // Without a drag lease, the same nonzero parameters must not change current mode.
+    // Opt-in speed-only mode keeps old 0x0B frames torque-neutral even when the
+    // legacy #LOCALCOMP parameters are nonzero.
     Motor plainCurrentMotor;
     Driver plainCurrentDriver;
     encoder.angleData.rectifiedAngle = 0;
@@ -233,19 +249,226 @@ int main() {
     encoder.calibrated = true;
     plainCurrentMotor.config.motionParams.ratedCurrent = 3000;
     plainCurrentMotor.Tick20kHz();
+    assert(plainCurrentMotor.controller->SetLocalCompOptIn(true, 0, 2, 0));
     plainCurrentMotor.controller->SetEnable(true);
     ticks(plainCurrentMotor, 3);
-    plainCurrentMotor.controller->SetCtrlMode(Motor::MODE_COMMAND_CURRENT);
-    plainCurrentMotor.controller->SetCurrentSetPoint(300);
-    ticks(plainCurrentMotor, 4000);
+    plainCurrentMotor.controller->SetLocalCompensationParam(0, 0);
     plainCurrentMotor.controller->SetLocalCompensationParam(1, 500);
+    plainCurrentMotor.controller->SetLocalCompensationParam(2, 0);
+    plainCurrentMotor.controller->SetLocalCompensationParam(3, 20);
     plainCurrentMotor.controller->SetLocalCompensationParam(4, 500);
-    for (int i = 0; i < 200; ++i)
+    assert(plainCurrentMotor.controller->RequestDragCurrent(0.3f, 1, 1000));
+    ticks(plainCurrentMotor, 4000);
+    for (int i = 0; i < 1024; ++i)
     {
-        ++encoder.angleData.rectifiedAngle;
+        encoder.angleData.rectifiedAngle += 4;
         plainCurrentMotor.Tick20kHz();
     }
     assert(plainCurrentDriver.current == 300);
+    assert(plainCurrentMotor.controller->GetLocalCompensationCurrent_mA() == 0);
 
-    std::cout << "F1 controller fault, hold, feed-forward and drag tests passed\n";
+    // Opt-in low-speed feedback uses a 256-tick (12.8 ms), non-overlapping
+    // window. Direction confidence advances once per completed window.
+    Motor lowSpeedMotor;
+    Driver lowSpeedDriver;
+    encoder.angleData.rectifiedAngle = 51100;
+    encoder.calibrated = true;
+    lowSpeedMotor.AttachEncoder(&encoder);
+    lowSpeedMotor.AttachDriver(&lowSpeedDriver);
+    lowSpeedMotor.controller->Init();
+    lowSpeedMotor.config.motionParams.ratedCurrent = 3000;
+    lowSpeedMotor.Tick20kHz();
+    assert(!lowSpeedMotor.controller->IsLocalCompOptInEnabled());
+    lowSpeedMotor.controller->SetEnable(true);
+    ticks(lowSpeedMotor, 3);
+    assert(lowSpeedMotor.controller->SetLocalCompOptIn(true, 0, 0x1234, 0));
+    for (int tick = 0; tick < Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS; ++tick)
+    {
+        if ((tick & 7) == 0)
+        {
+            ++encoder.angleData.rectifiedAngle;
+            if (encoder.angleData.rectifiedAngle == lowSpeedMotor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS)
+                encoder.angleData.rectifiedAngle = 0;
+        }
+        lowSpeedMotor.Tick20kHz();
+    }
+    assert(lowSpeedMotor.controller->IsAccurateVelocityReady());
+    assert(lowSpeedMotor.controller->GetMotionDirection() == 0);
+    for (int tick = 1;
+         tick < Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS *
+                    Motor::Controller::LOCAL_COMP_DIRECTION_CONFIRM_WINDOWS;
+         ++tick)
+    {
+        if ((tick & 7) == 0)
+        {
+            ++encoder.angleData.rectifiedAngle;
+            if (encoder.angleData.rectifiedAngle ==
+                lowSpeedMotor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS)
+                encoder.angleData.rectifiedAngle = 0;
+        }
+        lowSpeedMotor.Tick20kHz();
+    }
+    assert(lowSpeedMotor.controller->GetVelocity() *
+               (float) lowSpeedMotor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS ==
+           2500.0f);
+    assert(lowSpeedMotor.controller->GetMotionDirection() == 1);
+
+    // A same-direction speed between the exit and enter thresholds keeps the
+    // direction. Crossing the exit threshold on a fresh window releases it.
+    for (int tick = 0; tick < Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS; ++tick)
+    {
+        if ((tick & 15) == 0) ++encoder.angleData.rectifiedAngle;
+        lowSpeedMotor.Tick20kHz();
+    }
+    lowSpeedMotor.Tick20kHz(); // Complete the 256-tick sample boundary.
+    assert(lowSpeedMotor.controller->GetMotionDirection() == 1);
+    for (int tick = 0; tick < Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS; ++tick)
+    {
+        if ((tick & 31) == 0) ++encoder.angleData.rectifiedAngle;
+        lowSpeedMotor.Tick20kHz();
+    }
+    assert(lowSpeedMotor.controller->GetMotionDirection() == 0);
+
+    // Very high speed and a deliberately oversized viscous term must saturate
+    // cleanly at the new assist cap without overflowing the 20 kHz integer path.
+    Motor highSpeedMotor;
+    Driver highSpeedDriver;
+    encoder.angleData.rectifiedAngle = 0;
+    highSpeedMotor.AttachEncoder(&encoder);
+    highSpeedMotor.AttachDriver(&highSpeedDriver);
+    highSpeedMotor.controller->Init();
+    highSpeedMotor.config.motionParams.ratedCurrent = 3000;
+    highSpeedMotor.Tick20kHz();
+    assert(highSpeedMotor.controller->SetLocalCompOptIn(true, 100, 0x5678, 500));
+    assert(highSpeedMotor.controller->SetLocalCompensationParam(0, 0));
+    assert(highSpeedMotor.controller->SetLocalCompensationParam(1, 0));
+    assert(highSpeedMotor.controller->SetLocalCompensationParam(2, 1000000));
+    assert(highSpeedMotor.controller->SetLocalCompensationParam(3, 20));
+    assert(highSpeedMotor.controller->SetLocalCompensationParam(4, 500));
+    highSpeedMotor.controller->SetEnable(true);
+    ticks(highSpeedMotor, 3);
+    assert(highSpeedMotor.controller->RequestExtendedDragCurrent(
+        0, 600, 1, 1000));
+    for (int tick = 0; tick < 1024; ++tick)
+    {
+        encoder.angleData.rectifiedAngle =
+            (encoder.angleData.rectifiedAngle + 255) % 51200;
+        highSpeedMotor.Tick20kHz();
+    }
+    assert(highSpeedMotor.controller->GetMotionDirection() == 1);
+    assert(highSpeedMotor.controller->GetLocalCompensationCurrent_mA() == 500);
+    assert(highSpeedDriver.current == 500);
+
+    // E/O are applied in motor coordinates relative to configured home. The
+    // correction ramps in only after direction confidence and fades to zero
+    // at rest, while the underlying current stream remains qualified by drag.
+    Motor harmonicMotor;
+    Driver harmonicDriver;
+    encoder.angleData.rectifiedAngle = 10000;
+    encoder.calibrated = true;
+    harmonicMotor.AttachEncoder(&encoder);
+    harmonicMotor.AttachDriver(&harmonicDriver);
+    harmonicMotor.controller->Init();
+    harmonicMotor.config.motionParams.ratedCurrent = 3000;
+    harmonicMotor.config.motionParams.encoderHomeOffset = 10000;
+    harmonicMotor.Tick20kHz();
+    assert(harmonicMotor.controller->SetLocalCompOptIn(true, 100, 0x55AA, 500));
+    assert(harmonicMotor.controller->SetMotorDomainHarmonics(0, 400, 0, 200));
+    assert(harmonicMotor.controller->SetMotorDomainHarmonics(11, -22, 33, -44, true));
+    assert(boardConfig.harmonicESin_mA == 11 && boardConfig.harmonicECos_mA == -22 &&
+           boardConfig.harmonicOSin_mA == 33 && boardConfig.harmonicOCos_mA == -44);
+    assert(boardConfig.configStatus == CONFIG_COMMIT);
+    boardConfig.configStatus = CONFIG_OK;
+    assert(harmonicMotor.controller->SetMotorDomainHarmonics(0, 400, 0, 200));
+    int16_t checkESin, checkECos, checkOSin, checkOCos;
+    assert(!harmonicMotor.controller->SetMotorDomainHarmonics(
+        INT16_MIN, 400, 0, 200));
+    assert(!harmonicMotor.controller->SetMotorDomainHarmonics(
+        0, INT16_MAX, 0, 200));
+    assert(!harmonicMotor.controller->SetMotorDomainHarmonics(
+        0, 400, -501, 200));
+    assert(!harmonicMotor.controller->SetMotorDomainHarmonics(
+        0, 400, 0, 501));
+    harmonicMotor.controller->GetMotorDomainHarmonics(
+        checkESin, checkECos, checkOSin, checkOCos);
+    assert(checkESin == 0 && checkECos == 400 &&
+           checkOSin == 0 && checkOCos == 200);
+    assert(harmonicMotor.controller->SetMotorDomainHarmonics(
+        -500, 500, -500, 500));
+    harmonicMotor.controller->GetMotorDomainHarmonics(
+        checkESin, checkECos, checkOSin, checkOCos);
+    assert(checkESin == -500 && checkECos == 500 &&
+           checkOSin == -500 && checkOCos == 500);
+    assert(harmonicMotor.controller->SetMotorDomainHarmonics(0, 400, 0, 200));
+    assert(harmonicMotor.controller->SetLocalCompensationParam(0, 0));
+    assert(harmonicMotor.controller->SetLocalCompensationParam(1, 0));
+    assert(harmonicMotor.controller->SetLocalCompensationParam(2, 0));
+    assert(harmonicMotor.controller->SetLocalCompensationParam(3, 20));
+    assert(harmonicMotor.controller->SetLocalCompensationParam(4, 500));
+    harmonicMotor.controller->SetEnable(true);
+    ticks(harmonicMotor, 3);
+    assert(harmonicMotor.controller->RequestExtendedDragCurrent(
+        0, 600, 1, 1000));
+    for (int tick = 0; tick < 1024; ++tick)
+    {
+        if ((tick & 3) == 0) ++encoder.angleData.rectifiedAngle;
+        harmonicMotor.Tick20kHz();
+    }
+    assert(harmonicMotor.controller->modeRunning == Motor::MODE_COMMAND_CURRENT);
+    assert(harmonicMotor.controller->GetMotionDirection() == 1);
+    assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() > 400);
+    assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() <= 500);
+    assert(harmonicDriver.current ==
+           harmonicMotor.controller->GetLocalCompensationCurrent_mA());
+
+    ticks(harmonicMotor, Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS +
+                             20);
+    assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() == 0);
+    assert(harmonicDriver.current == 0);
+
+    assert(harmonicMotor.controller->SetMotorDomainHarmonics(0, 0, 0, 500));
+    assert(harmonicMotor.controller->RequestExtendedDragCurrent(
+        0, 600, 2, 1000));
+    for (int tick = 0; tick < Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS; ++tick)
+    {
+        if ((tick & 3) == 0)
+        {
+            if (encoder.angleData.rectifiedAngle == 0)
+                encoder.angleData.rectifiedAngle =
+                    harmonicMotor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS - 1;
+            else
+                --encoder.angleData.rectifiedAngle;
+        }
+        harmonicMotor.Tick20kHz();
+        assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() >= 0);
+    }
+    assert(harmonicMotor.controller->GetMotionDirection() == 0);
+    ticks(harmonicMotor, 20);
+    assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() == 0);
+    for (int tick = 20; tick <
+         Motor::Controller::LOCAL_COMP_SPEED_WINDOW_TICKS *
+             Motor::Controller::LOCAL_COMP_DIRECTION_CONFIRM_WINDOWS;
+         ++tick)
+    {
+        if ((tick & 3) == 0)
+        {
+            if (encoder.angleData.rectifiedAngle == 0)
+                encoder.angleData.rectifiedAngle =
+                    harmonicMotor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS - 1;
+            else
+                --encoder.angleData.rectifiedAngle;
+        }
+        harmonicMotor.Tick20kHz();
+    }
+    assert(harmonicMotor.controller->GetMotionDirection() == -1);
+    ticks(harmonicMotor, 200);
+    assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() < -400);
+    harmonicMotor.controller->SetCtrlMode(Motor::MODE_STOP);
+    ticks(harmonicMotor, 1);
+    assert(harmonicMotor.controller->GetLocalCompensationCurrent_mA() == 0);
+    assert(!harmonicMotor.controller->IsAccurateVelocityReady());
+    assert(harmonicMotor.controller->GetMotionDirection() == 0);
+    assert(harmonicDriver.current == 0);
+
+    std::cout << "F1 controller low-speed, direction, harmonic and drag tests passed\n";
 }
