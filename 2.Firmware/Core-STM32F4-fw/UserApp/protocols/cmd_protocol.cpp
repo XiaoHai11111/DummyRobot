@@ -28,3 +28,8 @@ static inline auto MakeObjTree()
 
 
 COMMIT_PROTOCOL
+
+// The protocol tree is large and only needed once. Static storage keeps it
+// off the communication task stack; allocating it there overflowed the stack
+// before USB/UART servers were started.
+treeType protocolTree = MakeObjTree();

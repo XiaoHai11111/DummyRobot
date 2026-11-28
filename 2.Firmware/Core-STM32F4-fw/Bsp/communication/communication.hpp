@@ -24,11 +24,10 @@ void UsbDeferredInterruptTask(void *ctx);
 
 #define COMMIT_PROTOCOL \
 using treeType = decltype(MakeObjTree());\
-uint8_t treeBuffer[sizeof(treeType)];\
+extern treeType protocolTree;\
 void CommitProtocol()\
 {\
-    auto treePtr = new(treeBuffer) treeType(MakeObjTree());\
-    fibre_publish(*treePtr);\
+    fibre_publish(protocolTree);\
 }\
 
 
