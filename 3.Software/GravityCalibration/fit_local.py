@@ -77,7 +77,8 @@ def main():
     args.output.write_text(json.dumps(model, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
     for label, pairs in [("train", train), ("validation", validation)]:
         np.savetxt(args.output.with_suffix(f".{label}.csv"), pairs, delimiter=",",
-                   header="q_deg,gravity_current_a,directional_loss_a,speed_deg_s", comments="")
+                   header="q_deg,gravity_current_a,directional_loss_a,speed_deg_s",
+                   comments="")
     print(json.dumps(metrics, indent=2))
     print(f"Saved {args.output}; fixed-pose model only, compensation remains disabled.")
 

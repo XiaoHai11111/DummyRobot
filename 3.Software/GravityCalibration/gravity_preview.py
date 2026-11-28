@@ -10,38 +10,72 @@ from calibration import MOTOR_SIGNS, predict_local
 HERE = Path(__file__).resolve().parent
 
 
-def model_gravity(q_deg, config_path, mjcf_path, gripper_rad=0.0):
-    import mujoco
+class GravityTorqueEvaluator:
+    """Evaluate zero-velocity MJCF holding torque in robot-joint coordinates."""
 
-    config = json.loads(Path(config_path).read_text())
-    q_deg = np.asarray(q_deg, dtype=float)
-    if q_deg.shape != (6,) or not np.isfinite(q_deg).all() or not np.isfinite(gripper_rad):
-        raise ValueError("Six finite joint angles and a finite gripper position are required")
-    if not 0 <= gripper_rad <= 0.78:
-        raise ValueError("Gripper position must be in 0..0.78 rad")
-    model = mujoco.MjModel.from_xml_path(str(Path(mjcf_path).resolve()))
-    data = mujoco.MjData(model)
-    indexes, signs = [], []
-    for q, mapping in zip(q_deg, config["robot"]["joints"]):
-        joint = model.joint(mapping["model_joint"])
-        sign = mapping["model_sign"]
-        if sign not in (-1, 1) or int(model.jnt_type[joint.id]) != int(mujoco.mjtJoint.mjJNT_HINGE):
-            raise ValueError("This preview supports one-DOF revolute arm joints")
-        if not mapping["min_deg"] <= q <= mapping["max_deg"]:
-            raise ValueError("Joint angle exceeds the real robot software limits")
-        value = np.deg2rad(sign * q + mapping["model_offset_deg"])
-        if model.jnt_limited[joint.id] and not model.jnt_range[joint.id, 0] <= value <= model.jnt_range[joint.id, 1]:
-            raise ValueError(f"{mapping['model_joint']}: outside MJCF range; reconcile model/hardware limits")
-        data.qpos[model.jnt_qposadr[joint.id]] = value
-        indexes.append(int(model.jnt_dofadr[joint.id]))
-        signs.append(sign)
-    for name in config["robot"]["gripper"]["model_joints"]:
-        data.qpos[model.jnt_qposadr[model.joint(name).id]] = gripper_rad
-    data.qvel[:] = 0
-    # qfrc_bias = C(q,v)v + g(q). It excludes constraint/contact and actuator force.
-    mujoco.mj_forward(model, data)
-    torque = np.asarray(signs) * data.qfrc_bias[indexes].copy()
-    return torque
+    def __init__(self, config_path, mjcf_path, gripper_rad=0.0):
+        import mujoco
+
+        if not np.isfinite(gripper_rad) or not 0 <= gripper_rad <= 0.78:
+            raise ValueError("Gripper position must be in 0..0.78 rad")
+        self.mujoco = mujoco
+        self.config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        self.model = mujoco.MjModel.from_xml_path(str(Path(mjcf_path).resolve()))
+        self.data = mujoco.MjData(self.model)
+        self.mappings = self.config["robot"]["joints"]
+        self.signs = []
+        self.qpos_addresses = []
+        self.dof_addresses = []
+        for mapping in self.mappings:
+            joint = self.model.joint(mapping["model_joint"])
+            sign = mapping["model_sign"]
+            if sign not in (-1, 1) or int(self.model.jnt_type[joint.id]) != int(
+                    mujoco.mjtJoint.mjJNT_HINGE):
+                raise ValueError("This preview supports one-DOF revolute arm joints")
+            self.signs.append(sign)
+            self.qpos_addresses.append(int(self.model.jnt_qposadr[joint.id]))
+            self.dof_addresses.append(int(self.model.jnt_dofadr[joint.id]))
+        self.finger_addresses = [
+            int(self.model.jnt_qposadr[self.model.joint(name).id])
+            for name in self.config["robot"]["gripper"]["model_joints"]
+        ]
+        self.gripper_rad = float(gripper_rad)
+
+    def joint_torque(self, q_deg, gripper_rad=None):
+        """Return six joint-positive N*m values with zero joint velocity."""
+        q_deg = np.asarray(q_deg, dtype=float)
+        if q_deg.shape != (6,) or not np.isfinite(q_deg).all():
+            raise ValueError("Expected six finite joint angles")
+        if gripper_rad is None:
+            gripper_rad = self.gripper_rad
+        if not np.isfinite(gripper_rad) or not 0 <= gripper_rad <= 0.78:
+            raise ValueError("Gripper position must be in 0..0.78 rad")
+        for q, mapping in zip(q_deg, self.mappings):
+            if not mapping["min_deg"] <= q <= mapping["max_deg"]:
+                raise ValueError("Joint angle exceeds the real robot software limits")
+            joint = self.model.joint(mapping["model_joint"])
+            value = np.deg2rad(mapping["model_sign"] * q + mapping["model_offset_deg"])
+            if (self.model.jnt_limited[joint.id]
+                    and not self.model.jnt_range[joint.id, 0] <= value
+                    <= self.model.jnt_range[joint.id, 1]):
+                raise ValueError(
+                    f"{mapping['model_joint']}: outside MJCF range; "
+                    "reconcile model/hardware limits")
+        for address, q, mapping in zip(self.qpos_addresses, q_deg, self.mappings):
+            self.data.qpos[address] = np.deg2rad(
+                mapping["model_sign"] * q + mapping["model_offset_deg"])
+        for address in self.finger_addresses:
+            self.data.qpos[address] = gripper_rad
+        self.data.qvel[:] = 0
+        self.mujoco.mj_forward(self.model, self.data)
+        return np.asarray([
+            sign * self.data.qfrc_bias[address]
+            for sign, address in zip(self.signs, self.dof_addresses)
+        ])
+
+
+def model_gravity(q_deg, config_path, mjcf_path, gripper_rad=0.0):
+    return GravityTorqueEvaluator(config_path, mjcf_path, gripper_rad).joint_torque(q_deg)
 
 
 def main():
